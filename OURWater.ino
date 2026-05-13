@@ -79,6 +79,7 @@ float    prevBatt24V      = -1.0f;
 uint32_t prevSolarAboveMs = 0;       // millis() when solar was last > 5V
 bool     solarAlarm       = false;
 bool     battAlarm        = false;
+float    current24V       = 0.0f;    // last measured 24V battery voltage
 
 // ─── CA Certificate ───────────────────────────────────────────────────────────
 const char* CA_CERT =
@@ -227,7 +228,7 @@ float readSolarVoltage() {
     uint32_t sum = 0;
     for (int i = 0; i < 10; i++) { sum += analogRead(SOLAR_VOLTAGE_PIN); delay(2); }
     int raw = (int)(sum / 10);
-    if (raw < 50) {
+    if (raw < 100) {
         Serial.printf("[ADC] Solar    IO8  raw=%4d  (floating — reporting 0.0V)\n", raw);
         return 0.0f;
     }
@@ -244,7 +245,7 @@ float readBattery24V() {
     uint32_t sum = 0;
     for (int i = 0; i < 10; i++) { sum += analogRead(BATTERY_24V_PIN); delay(2); }
     int raw = (int)(sum / 10);
-    if (raw < 50) {
+    if (raw < 100) {
         Serial.printf("[ADC] Batt24V  IO9  raw=%4d  (floating — reporting 0.0V)\n", raw);
         return 0.0f;
     }
@@ -312,6 +313,7 @@ void checkAlarmConditions(float solarV, float batt24V) {
 void checkAlarms() {
     float solarV  = readSolarVoltage();
     float batt24V = readBattery24V();
+    current24V    = batt24V;
     last24VPct    = voltage24VToPercent(batt24V);
     checkAlarmConditions(solarV, batt24V);
 }
@@ -813,6 +815,17 @@ void updatePowerManagement() {
         return;
     }
 
+    // A valid 24V lead-acid reads >= 21V even when fully dead.
+    // Readings below 10V mean the sensor is floating or the battery is
+    // physically absent — don't trigger low-battery states in that case.
+    if (current24V < 10.0f) {
+        if (powerState != PWR_NORMAL) {
+            powerState = PWR_NORMAL;
+            scheduleNextPublish();
+        }
+        return;
+    }
+
     // Determine target state from 24V battery percentage
     PowerState target;
     if      (last24VPct >= 65) target = PWR_NORMAL;
@@ -933,9 +946,11 @@ void setup() {
 
     // Initial 24V battery read to seed power management state before network init
     {
-        float v24 = readBattery24V();
+        float v24  = readBattery24V();
+        current24V = v24;
         last24VPct = voltage24VToPercent(v24);
-        Serial.printf("[Power] Initial 24V: %.2fV (%d%%)\n", v24, last24VPct);
+        Serial.printf("[Power] Initial 24V: %.2fV (%d%%)%s\n", v24, last24VPct,
+                      v24 < 10.0f ? " (no valid reading — power mgmt inactive)" : "");
     }
 
     // Load persisted interval from flash
