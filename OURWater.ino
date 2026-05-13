@@ -251,6 +251,10 @@ float readBattery24V() {
     }
     float v_pin    = raw * 3.3f / 4095.0f;
     float v_batt24 = v_pin * (110.0f / 10.0f);
+    if (v_batt24 < 10.0f) {
+        Serial.printf("[ADC] Batt24V  IO9  raw=%4d  v_batt=%.2fV  (below valid range — reporting 0.0V)\n", raw, v_batt24);
+        return 0.0f;
+    }
     Serial.printf("[ADC] Batt24V  IO9  raw=%4d  v_pin=%.3fV  v_batt=%.2fV\n", raw, v_pin, v_batt24);
     return v_batt24;
 }
