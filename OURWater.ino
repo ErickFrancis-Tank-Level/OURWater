@@ -234,6 +234,10 @@ float readSolarVoltage() {
     }
     float v_pin   = raw * 3.3f / 4095.0f;
     float v_solar = v_pin * (281.0f / 10.0f);
+    if (v_solar < 10.0f) {
+        Serial.printf("[ADC] Solar    IO8  raw=%4d  v_solar=%.2fV  (below valid range — reporting 0.0V)\n", raw, v_solar);
+        return 0.0f;
+    }
     Serial.printf("[ADC] Solar    IO8  raw=%4d  v_pin=%.3fV  v_solar=%.2fV\n", raw, v_pin, v_solar);
     return v_solar;
 }
