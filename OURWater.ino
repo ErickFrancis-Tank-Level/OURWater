@@ -60,6 +60,7 @@ int        last24VPct        = 100;
 uint8_t    max17048Addr      = 0x36;
 float    battPct             = 100.0f;
 float    battVoltage         = 0.0f;
+bool     battGaugeOk         = false;
 bool     onBackup            = false;
 uint8_t  configuredInterval  = 30;
 bool     mqttConnected       = false;
@@ -213,6 +214,7 @@ void updateBattery() {
         Serial.println("[Batt] MAX17048 read failed");
         return;
     }
+    battGaugeOk = true;
     onBackup    = (newPct < battPct - 0.2f);     // actively discharging → backup
     battPct     = newPct;
     battVoltage = newVoltage;
@@ -424,13 +426,22 @@ void publishData() {
     else if (solarAlarm)         alarmType = "solar_cut";
     else if (battAlarm)          alarmType = "battery_cut";
 
+    char battPctStr[8], battVStr[12];
+    if (battGaugeOk) {
+        snprintf(battPctStr, sizeof(battPctStr), "%d",   (int)battPct);
+        snprintf(battVStr,   sizeof(battVStr),   "%.2f", battVoltage);
+    } else {
+        strcpy(battPctStr, "null");
+        strcpy(battVStr,   "null");
+    }
+
     char payload[800];
     snprintf(payload, sizeof(payload),
         "{\"flow_1\":%lu,\"flow_2\":%lu,\"flow_3\":%lu,\"flow_4\":%lu,"
         "\"total_1\":%lu,\"total_2\":%lu,\"total_3\":%lu,\"total_4\":%lu,"
         "\"pressure_bar\":%.2f,\"distance_cm\":%.1f,"
         "\"valve_1\":\"%s\",\"valve_2\":\"%s\","
-        "\"battery_pct\":%d,\"battery_v\":%.2f,\"power_source\":\"%s\","
+        "\"battery_pct\":%s,\"battery_v\":%s,\"power_source\":\"%s\","
         "\"solar_v\":%.2f,\"solar_pct\":%d,"
         "\"battery_24v_v\":%.2f,\"battery_24v_pct\":%d,"
         "\"solar_alarm\":%s,\"battery_alarm\":%s,\"alarm_type\":\"%s\","
@@ -443,7 +454,7 @@ void publishData() {
         pressure, distance,
         valveStateStr(0),
         valveStateStr(1),
-        (int)battPct, battVoltage,
+        battPctStr, battVStr,
         onBackup ? "backup" : "main",
         solarV, solarPct,
         batt24V, batt24Pct,
