@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "board_config.h"
 
 HardwareSerial modemSerial(1);
 Preferences    prefs;
@@ -25,17 +26,10 @@ Preferences    prefs;
 #define BATTERY_SCL      16
 #define SOLAR_VOLTAGE_PIN  8   // IO8 — solar panel voltage divider
 #define BATTERY_24V_PIN    9   // IO9 — 24V battery voltage divider
-#define TEST_MODE        true
 #define CUBIC_METRES_PER_PULSE 0.001f   // 1 pulse = 1 L; conversion to m³ happens in dashboard
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 #define FIRMWARE_VER  "1.2.0"
-
-#define MQTT_BROKER   "tcp://g7214f51.ala.eu-central-1.emqxsl.com:8883"
-#define MQTT_USER     "ourwater_esp32"
-#define MQTT_PASS     "@1Mandela1234"
-#define MQTT_CLIENT   "ourwater_001"
-#define BASE_TOPIC    "ourwater/ourwater_botswana/site_001_meter_01"
 
 #define BATT_LOW_PCT     70
 #define VALVE_PULSE_MS  500
@@ -169,23 +163,49 @@ float readSonarCm() {
     return duration * 0.01715f;   // µs × (0.0343 cm/µs ÷ 2)
 }
 
-void probeMAX17048() {
-    const uint8_t candidates[2] = {0x36, 0x6C};
-    bool found = false;
-    for (int i = 0; i < 2; i++) {
-        Wire.beginTransmission(candidates[i]);
-        byte err = Wire.endTransmission();
-        Serial.printf("[I2C] Probe 0x%02X: %s\n", candidates[i], err == 0 ? "ACK ✓" : "NACK");
-        if (err == 0 && !found) {
-            max17048Addr = candidates[i];
-            found = true;
+int i2cScanBus(int sda, int scl) {
+    Wire.end();
+    gpio_set_pull_mode((gpio_num_t)sda, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode((gpio_num_t)scl, GPIO_PULLUP_ONLY);
+    Wire.begin(sda, scl);
+    Wire.setClock(100000);
+    delay(50);
+    int found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("[I2C]   0x%02X  ACK ✓\n", addr);
+            found++;
         }
     }
-    if (found) {
-        Serial.printf("[I2C] MAX17048 using address 0x%02X\n", max17048Addr);
-    } else {
-        Serial.println("[I2C] MAX17048 not found — check wiring on SDA=15 SCL=16");
+    return found;
+}
+
+void i2cScan() {
+    Serial.println("[I2C] Scanning SDA=15 SCL=16 —");
+    int n = i2cScanBus(BATTERY_SDA, BATTERY_SCL);
+    if (n == 0) {
+        Serial.println("[I2C]   no devices found — trying swapped pins (SDA=16 SCL=15)");
+        n = i2cScanBus(BATTERY_SCL, BATTERY_SDA);
+        if (n > 0) {
+            Serial.println("[I2C] *** SDA/SCL are SWAPPED in firmware — found devices with SDA=16 SCL=15");
+        } else {
+            Serial.println("[I2C]   still no devices — check power/wiring to MAX17048");
+        }
     }
+    Serial.printf("[I2C] Scan done (%d device(s))\n", n);
+}
+
+bool probeMAX17048() {
+    Wire.beginTransmission(0x36);
+    byte err = Wire.endTransmission();
+    Serial.printf("[I2C] Probe MAX17048 0x36: %s\n", err == 0 ? "ACK ✓" : "NACK");
+    if (err == 0) {
+        max17048Addr = 0x36;
+        Serial.println("[I2C] MAX17048 found at 0x36");
+        return true;
+    }
+    return false;
 }
 
 bool readMAX17048(float &pct, float &voltage) {
@@ -209,9 +229,14 @@ bool readMAX17048(float &pct, float &voltage) {
 }
 
 void updateBattery() {
+    if (!battGaugeOk) {
+        // Keep trying to find the chip every call until it responds
+        if (!probeMAX17048()) return;
+    }
     float newPct = battPct, newVoltage = battVoltage;
     if (!readMAX17048(newPct, newVoltage)) {
-        Serial.println("[Batt] MAX17048 read failed");
+        Serial.println("[Batt] MAX17048 read failed — will retry");
+        battGaugeOk = false;   // lost contact; scan again next time
         return;
     }
     battGaugeOk = true;
@@ -720,6 +745,15 @@ bool mqttConnect() {
 
     sendAT("AT+CMQTTSSLCFG=0,0", "OK", 2000);
 
+    // Last Will & Testament — broker publishes this automatically if board disconnects
+    const char* lwtTopic   = BASE_TOPIC "/status";
+    const char* lwtPayload = "{\"status\":\"offline\"}";
+    String willTopicCmd = "AT+CMQTTWILLTOPIC=0," + String(strlen(lwtTopic)) + ",1,1";
+    sendATData(willTopicCmd.c_str(), lwtTopic,   "OK", 5000);
+    String willMsgCmd   = "AT+CMQTTWILLMSG=0,"  + String(strlen(lwtPayload)) + ",1";
+    sendATData(willMsgCmd.c_str(),   lwtPayload, "OK", 5000);
+    Serial.println("[MQTT] LWT configured (offline retained QoS 1)");
+
     Serial.println("[MQTT] Connecting...");
     r = sendAT(
         "AT+CMQTTCONNECT=0,\"" MQTT_BROKER "\",60,1,\"" MQTT_USER "\",\"" MQTT_PASS "\"",
@@ -939,10 +973,20 @@ void setup() {
     Serial.println("[GPIO] Sonar ready (TRIG=42 ECHO=34)");
 
     // I2C — MAX17048 battery gauge
+    Serial.println("[I2C] Initialising (SDA=15 SCL=16, 100kHz, pull-ups enabled)");
+    delay(500);   // give MAX17048 time to power up
+    i2cScan();    // prints which pin combo (if any) finds devices
+    // Restore canonical bus config after scan
+    gpio_set_pull_mode(GPIO_NUM_15, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_NUM_16, GPIO_PULLUP_ONLY);
+    Wire.end();
     Wire.begin(BATTERY_SDA, BATTERY_SCL);
-    Serial.println("[I2C] Bus started (SDA=15 SCL=16)");
-    delay(100);
-    probeMAX17048();
+    Wire.setClock(100000);
+    if (!probeMAX17048()) {
+        Serial.println("[I2C] MAX17048 not found at boot — will retry in loop");
+    } else {
+        battGaugeOk = false;   // probe passed; let updateBattery do the first real read
+    }
 
     // ADC pin config diagnostic
     pinMode(BATTERY_24V_PIN, INPUT);
