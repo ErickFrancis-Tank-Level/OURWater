@@ -7,33 +7,8 @@
 HardwareSerial modemSerial(1);
 Preferences    prefs;
 
-// ─── Pin Definitions ──────────────────────────────────────────────────────────
-#define MODEM_POWER      33
-#define MODEM_RX         17
-#define MODEM_TX         18
-#define FLOW_1           21
-#define FLOW_2           40
-#define FLOW_3           41
-#define FLOW_4           39
-#define VALVE_1_OPEN     45
-#define VALVE_1_CLOSE    35
-#define VALVE_2_OPEN     36
-#define VALVE_2_CLOSE    37
-#define PRESSURE_PIN      1
-#define SONAR_TRIG       42
-#define SONAR_ECHO       34
-#define BATTERY_SDA      15
-#define BATTERY_SCL      16
-#define SOLAR_VOLTAGE_PIN  8   // IO8 — solar panel voltage divider
-#define BATTERY_24V_PIN    9   // IO9 — 24V battery voltage divider
-#define CUBIC_METRES_PER_PULSE 0.001f   // 1 pulse = 1 L; conversion to m³ happens in dashboard
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 #define FIRMWARE_VER  "1.2.0"
-
-#define BATT_LOW_PCT     70
-#define VALVE_PULSE_MS  500
-#define PRESSURE_MAX_BAR 10.0f   // full-scale of the 4-20mA transducer
 
 const uint8_t VALID_INTERVALS[] = {1, 15, 30, 60, 120};
 #define NUM_VALID_INTERVALS 5
@@ -143,6 +118,7 @@ void sendATData(const char* cmd, const char* data, const char* expected, uint32_
 }
 
 // ─── Sensors ──────────────────────────────────────────────────────────────────
+#if HAS_PRESSURE
 float readPressureBar() {
     uint32_t sum = 0;
     for (int i = 0; i < 16; i++) sum += analogRead(PRESSURE_PIN);
@@ -151,7 +127,9 @@ float readPressureBar() {
     float bar       = (currentMA - 4.0f) / 16.0f * PRESSURE_MAX_BAR;
     return constrain(bar, 0.0f, PRESSURE_MAX_BAR);
 }
+#endif
 
+#if HAS_SONAR
 float readSonarCm() {
     digitalWrite(SONAR_TRIG, LOW);
     delayMicroseconds(2);
@@ -162,6 +140,7 @@ float readSonarCm() {
     if (duration == 0) return -1.0f;
     return duration * 0.01715f;   // µs × (0.0343 cm/µs ÷ 2)
 }
+#endif
 
 int i2cScanBus(int sda, int scl) {
     Wire.end();
@@ -246,12 +225,10 @@ void updateBattery() {
 }
 
 // ─── Solar / 24V battery voltage ─────────────────────────────────────────────
-// Solar (IO8): divider 220k+51k top, 10k bottom → scale = 281/10 = 28.1
-// 24V bat (IO9): divider 100k top, 10k bottom → scale = 110/10 = 11.0
 float readSolarVoltage() {
     pinMode(SOLAR_VOLTAGE_PIN, INPUT);
-    gpio_pullup_dis(GPIO_NUM_8);
-    gpio_pulldown_dis(GPIO_NUM_8);
+    gpio_pullup_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
+    gpio_pulldown_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
     uint32_t sum = 0;
     for (int i = 0; i < 10; i++) { sum += analogRead(SOLAR_VOLTAGE_PIN); delay(2); }
     int raw = (int)(sum / 10);
@@ -260,7 +237,7 @@ float readSolarVoltage() {
         return 0.0f;
     }
     float v_pin   = raw * 3.3f / 4095.0f;
-    float v_solar = v_pin * (281.0f / 10.0f);
+    float v_solar = v_pin * SOLAR_ADC_SCALE;
     if (v_solar < 10.0f) {
         Serial.printf("[ADC] Solar    IO8  raw=%4d  v_solar=%.2fV  (below valid range — reporting 0.0V)\n", raw, v_solar);
         return 0.0f;
@@ -271,8 +248,8 @@ float readSolarVoltage() {
 
 float readBattery24V() {
     pinMode(BATTERY_24V_PIN, INPUT);
-    gpio_pullup_dis(GPIO_NUM_9);
-    gpio_pulldown_dis(GPIO_NUM_9);
+    gpio_pullup_dis((gpio_num_t)BATTERY_24V_PIN);
+    gpio_pulldown_dis((gpio_num_t)BATTERY_24V_PIN);
     uint32_t sum = 0;
     for (int i = 0; i < 10; i++) { sum += analogRead(BATTERY_24V_PIN); delay(2); }
     int raw = (int)(sum / 10);
@@ -281,7 +258,7 @@ float readBattery24V() {
         return 0.0f;
     }
     float v_pin    = raw * 3.3f / 4095.0f;
-    float v_batt24 = v_pin * (110.0f / 10.0f);
+    float v_batt24 = v_pin * BATT24V_ADC_SCALE;
     if (v_batt24 < 10.0f) {
         Serial.printf("[ADC] Batt24V  IO9  raw=%4d  v_batt=%.2fV  (below valid range — reporting 0.0V)\n", raw, v_batt24);
         return 0.0f;
@@ -291,16 +268,14 @@ float readBattery24V() {
 }
 
 int voltage24VToPercent(float v) {
-    // 24V lead-acid: 25.6V = 100%, 21.0V = 0%
-    float pct = (v - 21.0f) / (25.6f - 21.0f) * 100.0f;
+    float pct = (v - BATT24V_EMPTY_V) / (BATT24V_FULL_V - BATT24V_EMPTY_V) * 100.0f;
     if (pct > 100.0f) pct = 100.0f;
     if (pct <   0.0f) pct =   0.0f;
     return (int)pct;
 }
 
 int solarVoltageToPercent(float v) {
-    // 2× panels in series: ~40V peak
-    float pct = (v / 40.0f) * 100.0f;
+    float pct = (v / SOLAR_MAX_V) * 100.0f;
     if (pct > 100.0f) pct = 100.0f;
     if (pct <   0.0f) pct =   0.0f;
     return (int)pct;
@@ -436,8 +411,16 @@ void publishData() {
 
     for (int i = 0; i < 4; i++) totalPulses[i] += pulses[i];
 
+#if HAS_PRESSURE
     float   pressure    = readPressureBar();
+#else
+    float   pressure    = 0.0f;
+#endif
+#if HAS_SONAR
     float   distance    = readSonarCm();
+#else
+    float   distance    = -1.0f;
+#endif
     uint8_t interval    = getActiveInterval();
     float   solarV      = readSolarVoltage();
     int     solarPct    = solarVoltageToPercent(solarV);
@@ -788,7 +771,7 @@ void runCriticalMode() {
     modemPowerOff();
 
     // Configure flow pins as GPIO wakeup sources (INPUT_PULLUP → active LOW)
-    const gpio_num_t flowGPIOs[4] = {GPIO_NUM_21, GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_39};
+    const gpio_num_t flowGPIOs[4] = {(gpio_num_t)FLOW_1, (gpio_num_t)FLOW_2, (gpio_num_t)FLOW_3, (gpio_num_t)FLOW_4};
     for (int i = 0; i < 4; i++) {
         gpio_wakeup_enable(flowGPIOs[i], GPIO_INTR_LOW_LEVEL);
     }
@@ -966,19 +949,21 @@ void setup() {
     }
     Serial.println("[GPIO] Valve outputs ready (45/35/36/37)");
 
+#if HAS_SONAR
     // Sonar
     pinMode(SONAR_TRIG, OUTPUT);
     pinMode(SONAR_ECHO, INPUT);
     digitalWrite(SONAR_TRIG, LOW);
     Serial.println("[GPIO] Sonar ready (TRIG=42 ECHO=34)");
+#endif
 
     // I2C — MAX17048 battery gauge
     Serial.println("[I2C] Initialising (SDA=15 SCL=16, 100kHz, pull-ups enabled)");
     delay(500);   // give MAX17048 time to power up
     i2cScan();    // prints which pin combo (if any) finds devices
     // Restore canonical bus config after scan
-    gpio_set_pull_mode(GPIO_NUM_15, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(GPIO_NUM_16, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode((gpio_num_t)BATTERY_SDA, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode((gpio_num_t)BATTERY_SCL, GPIO_PULLUP_ONLY);
     Wire.end();
     Wire.begin(BATTERY_SDA, BATTERY_SCL);
     Wire.setClock(100000);
@@ -990,9 +975,9 @@ void setup() {
 
     // ADC pin config diagnostic
     pinMode(BATTERY_24V_PIN, INPUT);
-    gpio_pullup_dis(GPIO_NUM_9); gpio_pulldown_dis(GPIO_NUM_9);
+    gpio_pullup_dis((gpio_num_t)BATTERY_24V_PIN); gpio_pulldown_dis((gpio_num_t)BATTERY_24V_PIN);
     pinMode(SOLAR_VOLTAGE_PIN, INPUT);
-    gpio_pullup_dis(GPIO_NUM_8); gpio_pulldown_dis(GPIO_NUM_8);
+    gpio_pullup_dis((gpio_num_t)SOLAR_VOLTAGE_PIN); gpio_pulldown_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
     Serial.println("[CAL] IO9 (Battery 24V) raw ADC readings:");
     uint32_t calSum = 0;
     for (int i = 0; i < 10; i++) {
