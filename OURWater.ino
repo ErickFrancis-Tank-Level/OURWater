@@ -19,10 +19,11 @@ volatile uint32_t lastFlowMs[4]  = {0, 0, 0, 0};
 uint32_t          totalPulses[4] = {0, 0, 0, 0};
 
 // ─── Device state ─────────────────────────────────────────────────────────────
-enum ValveState  : uint8_t { VALVE_STOPPED, VALVE_OPENING, VALVE_CLOSING };
+enum ValveState  : uint8_t { VALVE_STOPPED, VALVE_OPENING, VALVE_CLOSING, VALVE_OPEN, VALVE_CLOSED };
 enum PowerState  : uint8_t { PWR_NORMAL, PWR_WARNING, PWR_CRITICAL, PWR_INTERNAL_ONLY };
 
-ValveState valveState[2]     = {VALVE_STOPPED, VALVE_STOPPED};
+ValveState valveState[2]       = {VALVE_STOPPED, VALVE_STOPPED};
+uint32_t   valveMoveStartMs[2] = {0, 0};
 PowerState powerState        = PWR_NORMAL;
 int        last24VPct        = 100;
 
@@ -38,6 +39,11 @@ uint32_t lastBattReadMs      = 0;
 uint32_t lastAdcPrintMs      = 0;
 uint32_t lastAlarmMs         = 0;
 
+String   uartBuf;
+uint32_t uartBufMs    = 0;
+#define  UART_BUF_MAX   2048
+#define  UART_STALE_MS  10000
+
 // NTP / publish scheduling
 uint32_t ntpSecondsOfDay = 0;
 uint32_t ntpBootMs       = 0;
@@ -50,6 +56,8 @@ uint32_t prevSolarAboveMs = 0;       // millis() when solar was last > 5V
 bool     solarAlarm       = false;
 bool     battAlarm        = false;
 float    current24V       = 0.0f;    // last measured 24V battery voltage
+float    lastSolarV       = 0.0f;    // cached by checkAlarms(); read by publishData()
+int      lastSolarPct     = 0;
 
 // ─── CA Certificate ───────────────────────────────────────────────────────────
 const char* CA_CERT =
@@ -325,6 +333,8 @@ void checkAlarms() {
     float batt24V = readBattery24V();
     current24V    = batt24V;
     last24VPct    = voltage24VToPercent(batt24V);
+    lastSolarV    = solarV;
+    lastSolarPct  = solarVoltageToPercent(solarV);
     checkAlarmConditions(solarV, batt24V);
 }
 
@@ -427,12 +437,7 @@ void publishData() {
     float   distance    = -1.0f;
 #endif
     uint8_t interval    = getActiveInterval();
-    float   solarV      = readSolarVoltage();
-    int     solarPct    = solarVoltageToPercent(solarV);
-    float   batt24V     = readBattery24V();
-    int     batt24Pct   = voltage24VToPercent(batt24V);
-
-    checkAlarmConditions(solarV, batt24V);
+    // Use values cached by checkAlarms() on the 2 s cadence
 
     const char* alarmType = "none";
     if (solarAlarm && battAlarm) alarmType = "both";
@@ -469,8 +474,8 @@ void publishData() {
         valveStateStr(1),
         battPctStr, battVStr,
         onBackup ? "backup" : "main",
-        solarV, solarPct,
-        batt24V, batt24Pct,
+        lastSolarV, lastSolarPct,
+        current24V, last24VPct,
         solarAlarm ? "true" : "false",
         battAlarm  ? "true" : "false",
         alarmType,
@@ -487,6 +492,8 @@ const char* valveStateStr(uint8_t idx) {
     switch (valveState[idx]) {
         case VALVE_OPENING: return "opening";
         case VALVE_CLOSING: return "closing";
+        case VALVE_OPEN:    return "open";
+        case VALVE_CLOSED:  return "closed";
         default:            return "stopped";
     }
 }
@@ -538,9 +545,15 @@ void handleValveCmd(uint8_t valveIdx, const String& cmd) {
 
     safeSetValve((int)(valveIdx + 1), action);
 
-    if      (action == "open")  valveState[valveIdx] = VALVE_OPENING;
-    else if (action == "close") valveState[valveIdx] = VALVE_CLOSING;
-    else                        valveState[valveIdx] = VALVE_STOPPED;
+    if (action == "open") {
+        valveState[valveIdx]       = VALVE_OPENING;
+        valveMoveStartMs[valveIdx] = millis();
+    } else if (action == "close") {
+        valveState[valveIdx]       = VALVE_CLOSING;
+        valveMoveStartMs[valveIdx] = millis();
+    } else {
+        valveState[valveIdx] = VALVE_STOPPED;
+    }
 }
 
 // ─── Interval command ─────────────────────────────────────────────────────────
@@ -558,33 +571,60 @@ void handleIntervalCmd(const String& payload) {
 
 // ─── Incoming MQTT message parser ─────────────────────────────────────────────
 void checkIncoming() {
-    if (!modemSerial.available()) return;
-    delay(200);
-    String raw = "";
-    while (modemSerial.available()) raw += (char)modemSerial.read();
-    if (raw.length() == 0 || raw.indexOf("+CMQTTRXSTART:") < 0) return;
+    while (modemSerial.available()) {
+        if (uartBuf.length() == 0) uartBufMs = millis();
+        uartBuf += (char)modemSerial.read();
+    }
+    if (uartBuf.length() == 0) return;
 
-    Serial.println("[MQTT] Incoming: " + raw);
+    if (uartBuf.length() > UART_BUF_MAX) {
+        Serial.printf("[UART] Buf overflow (%u B, no frame) — flushing\n", uartBuf.length());
+        uartBuf = ""; uartBufMs = 0;
+        return;
+    }
+    if (millis() - uartBufMs > UART_STALE_MS) {
+        Serial.printf("[UART] Stale buf (%u B, %lu ms) — flushing\n",
+                      uartBuf.length(), millis() - uartBufMs);
+        uartBuf = ""; uartBufMs = 0;
+        return;
+    }
 
-    int topicIdx   = raw.indexOf("+CMQTTRXTOPIC:");
-    int payloadIdx = raw.indexOf("+CMQTTRXPAYLOAD:");
-    if (topicIdx < 0 || payloadIdx < 0) return;
+    int startIdx = uartBuf.indexOf("+CMQTTRXSTART:");
+    int endIdx   = uartBuf.indexOf("+CMQTTRXEND:");
+    if (startIdx < 0 || endIdx < 0 || endIdx < startIdx) return;
 
-    int tLineEnd = raw.indexOf('\n', topicIdx);
-    String topic = raw.substring(tLineEnd + 1, raw.indexOf('\n', tLineEnd + 1));
+    int frameEnd = uartBuf.indexOf('\n', endIdx);
+    if (frameEnd < 0) return;
+
+    String frame = uartBuf.substring(startIdx, frameEnd + 1);
+    uartBuf   = uartBuf.substring(frameEnd + 1);
+    uartBufMs = uartBuf.length() > 0 ? millis() : 0;
+
+    Serial.printf("[MQTT] Frame buffered (%u B) — parsing\n", frame.length());
+
+    int topicIdx   = frame.indexOf("+CMQTTRXTOPIC:");
+    int payloadIdx = frame.indexOf("+CMQTTRXPAYLOAD:");
+    if (topicIdx < 0 || payloadIdx < 0) {
+        Serial.println("[MQTT] Malformed frame — missing topic/payload markers");
+        return;
+    }
+
+    int tLineEnd = frame.indexOf('\n', topicIdx);
+    String topic = frame.substring(tLineEnd + 1, frame.indexOf('\n', tLineEnd + 1));
     topic.trim();
 
-    int pLineEnd = raw.indexOf('\n', payloadIdx);
-    String payload = raw.substring(pLineEnd + 1);
-    int endIdx = payload.indexOf("+CMQTTRXEND:");
-    if (endIdx >= 0) payload = payload.substring(0, endIdx);
+    int pLineEnd = frame.indexOf('\n', payloadIdx);
+    String payload = frame.substring(pLineEnd + 1);
+    int pEndIdx = payload.indexOf("+CMQTTRXEND:");
+    if (pEndIdx >= 0) payload = payload.substring(0, pEndIdx);
     payload.trim();
 
-    Serial.println("[MQTT] Topic: " + topic + " | Payload: " + payload);
+    Serial.printf("[MQTT] CMD  topic=%s  payload=%s\n", topic.c_str(), payload.c_str());
 
-    if      (topic.endsWith("/valve/1/cmd"))       handleValveCmd(0, payload);
-    else if (topic.endsWith("/valve/2/cmd"))       handleValveCmd(1, payload);
-    else if (topic.endsWith("/config/interval"))   handleIntervalCmd(payload);
+    if      (topic.endsWith("/valve/1/cmd"))     { handleValveCmd(0, payload);  Serial.println("[MQTT] Acted: valve/1/cmd");     }
+    else if (topic.endsWith("/valve/2/cmd"))     { handleValveCmd(1, payload);  Serial.println("[MQTT] Acted: valve/2/cmd");     }
+    else if (topic.endsWith("/config/interval")) { handleIntervalCmd(payload);  Serial.println("[MQTT] Acted: config/interval"); }
+    else { Serial.printf("[MQTT] Unhandled topic: %s\n", topic.c_str()); }
 }
 
 // ─── Modem power ──────────────────────────────────────────────────────────────
@@ -621,6 +661,11 @@ void modemPowerCycle() {
 
 // ─── Load CA cert ─────────────────────────────────────────────────────────────
 void loadCACert() {
+    static bool certInstalled = false;
+    if (certInstalled) {
+        Serial.println("[SSL] CA cert already installed — skipping AT+CCERTDOWN");
+        return;
+    }
     Serial.println("[SSL] Loading CA certificate...");
     int certLen = strlen(CA_CERT);
     String cmd = "AT+CCERTDOWN=\"emqx-ca.pem\"," + String(certLen);
@@ -647,6 +692,12 @@ void loadCACert() {
         yield();
     }
     Serial.println("[SSL] Cert response: " + response);
+    if (response.indexOf("OK") >= 0) {
+        certInstalled = true;
+        Serial.println("[SSL] CA cert installed — will skip on future networkInit() calls");
+    } else {
+        Serial.println("[SSL] CA cert install FAILED — will retry next networkInit()");
+    }
 }
 
 // ─── Network init ─────────────────────────────────────────────────────────────
@@ -924,6 +975,45 @@ void checkPowerState() {
     }
 }
 
+// ─── Non-blocking valve travel auto-stop ─────────────────────────────────────
+void serviceValves() {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < 2; i++) {
+        if (valveState[i] == VALVE_OPENING || valveState[i] == VALVE_CLOSING) {
+            if (now - valveMoveStartMs[i] >= VALVE_TRAVEL_MS) {
+                bool wasOpening = (valveState[i] == VALVE_OPENING);
+                safeSetValve(i + 1, "stop");
+                valveState[i] = wasOpening ? VALVE_OPEN : VALVE_CLOSED;
+                Serial.printf("[Valve %d] travel complete -> %s (relay off)\n",
+                              i + 1, wasOpening ? "open" : "closed");
+                if (mqttConnected) publishData();
+            }
+        }
+    }
+}
+
+// ─── Strapping-pin self-check ─────────────────────────────────────────────────
+// Call BEFORE any pinMode(OUTPUT) so the levels reflect what the external
+// circuit presents at power-on — i.e. what the chip sampled during reset.
+static void logStrappingPins() {
+    static const struct { uint8_t pin; const char* fn; const char* role; } kStrap[] = {
+        {  0, "boot-mode   (H=run, L=download)",  "UNUSED"             },
+        {  3, "JTAG-sel    (H=USB-JTAG, L=GPIO)", "UNUSED"             },
+        { 45, "VDD_SPI-sel (H=3V3-LDO, L=ext)",   "VALVE_1_OPEN relay" },
+        { 46, "ROM-log     (H=print, L=silent)",   "UNUSED"             },
+    };
+    Serial.println("[Strap] Strapping-pin audit (read before GPIO init):");
+    for (const auto& s : kStrap) {
+        pinMode(s.pin, INPUT);
+        int lvl = digitalRead(s.pin);
+        Serial.printf("[Strap]   GPIO%-2d  %-38s  level=%d  role=%s%s\n",
+                      s.pin, s.fn, lvl, s.role,
+                      (s.pin == 45 && lvl == 1)
+                        ? "  *** HIGH — relay idles HIGH at boot; unintended valve pulse possible"
+                        : "");
+    }
+}
+
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
     // Hold MODEM_POWER HIGH immediately so the battery boost circuit
@@ -936,6 +1026,8 @@ void setup() {
     Serial.println("\n=============================");
     Serial.println(" OURWater Firmware v" FIRMWARE_VER);
     Serial.println("=============================");
+
+    logStrappingPins();   // must run before any pinMode(OUTPUT)
 
     // Flow sensor interrupts
     const uint8_t flowPins[4] = {FLOW_1, FLOW_2, FLOW_3, FLOW_4};
@@ -1031,6 +1123,8 @@ void setup() {
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
+    serviceValves();   // first — de-energises relays on travel timeout even while MQTT is down
+
     // ── Critical checks always run regardless of MQTT state ──────────────────
     if (millis() - lastBattReadMs >= 1000) {
         lastBattReadMs = millis();

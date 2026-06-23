@@ -65,7 +65,7 @@
 // -----------------------------------------------------------------------------
 #define CUBIC_METRES_PER_PULSE   0.001f
 
-#define VALVE_PULSE_MS           500
+#define VALVE_TRAVEL_MS          15000    // ~15 s end-to-end travel; relay de-energised by serviceValves()
 
 #define SOLAR_ADC_SCALE          28.1f    // TODO: verify divider on this PCB
 #define BATT24V_ADC_SCALE        11.0f    // TODO: verify divider on this PCB

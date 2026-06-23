@@ -25,6 +25,16 @@
 //  Motorised valve relay pairs
 //  Never energise both pins of a pair simultaneously.
 // -----------------------------------------------------------------------------
+// ⚠ STRAPPING PIN — GPIO45 controls VDD_SPI voltage selection on ESP32-S3.
+//   The chip samples GPIO45 at every reset/power-on:
+//     HIGH → VDD_SPI powered by internal 3.3 V LDO
+//     LOW  → VDD_SPI expected from an external supply
+//   If the relay module's IN resistor idles HIGH before firmware runs:
+//     (a) VDD_SPI is locked to 3V3 LDO for this boot (usually harmless here)
+//     (b) if the relay is active-HIGH, an unintended OPEN pulse reaches the
+//         valve actuator before setup() drives GPIO45 LOW.
+//   Run the bench self-check below (grep [Strap] in Serial log) to confirm
+//   the idle level.  If it reads 1, rewire to GPIO38 (strap-free, unused).
 #define VALVE_1_OPEN      45
 #define VALVE_1_CLOSE     35
 #define VALVE_2_OPEN      36
@@ -69,7 +79,7 @@
 #define CUBIC_METRES_PER_PULSE   0.001f   // YF-S201: 1 pulse = 1 L
 
 #define PRESSURE_MAX_BAR         10.0f    // 4-20 mA transducer full-scale
-#define VALVE_PULSE_MS           500      // relay energise duration (ms)
+#define VALVE_TRAVEL_MS          15000    // ~15 s end-to-end travel; relay de-energised by serviceValves()
 
 #define SOLAR_ADC_SCALE          28.1f    // (220k+51k+10k)/10k
 #define BATT24V_ADC_SCALE        11.0f    // (100k+10k)/10k
