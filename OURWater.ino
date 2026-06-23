@@ -410,6 +410,11 @@ void publishData() {
     interrupts();
 
     for (int i = 0; i < 4; i++) totalPulses[i] += pulses[i];
+    for (int i = 0; i < 4; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "total%d", i);
+        prefs.putULong(key, totalPulses[i]);
+    }
 
 #if HAS_PRESSURE
     float   pressure    = readPressureBar();
@@ -1005,8 +1010,14 @@ void setup() {
     prefs.begin("ourwater", false);
     configuredInterval = prefs.getUChar("interval", 30);
     if (!isValidInterval(configuredInterval)) configuredInterval = 30;
-    Serial.printf("[Config] Interval=%dmin  TEST_MODE=%s\n",
-                  configuredInterval, TEST_MODE ? "ON" : "OFF");
+    for (int i = 0; i < 4; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "total%d", i);
+        totalPulses[i] = prefs.getULong(key, 0);
+    }
+    Serial.printf("[Config] Interval=%dmin  TEST_MODE=%s  Totals=%lu/%lu/%lu/%lu\n",
+                  configuredInterval, TEST_MODE ? "ON" : "OFF",
+                  totalPulses[0], totalPulses[1], totalPulses[2], totalPulses[3]);
 
     modemPowerOn();
     if (!networkInit()) {
