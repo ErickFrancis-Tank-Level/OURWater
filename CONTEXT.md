@@ -9,14 +9,18 @@
 ## Repository Layout
 
 ```
-OURWater/
-├── board_config.h              ← Edit this when flashing a new board
-├── OURWater.ino                ← Main firmware — do not edit for new boards
+OURWater/                                ← This repo (github: OURWater)
+├── board_config.h                       ← Edit this when flashing a new board
+├── OURWater.ino                         ← Main firmware — do not edit for new boards
 ├── boards/
-│   ├── waveshare_s3.h          ← Waveshare ESP32-S3 4G LTE (confirmed field unit)
-│   └── makerfabs_a7670.h       ← Makerfabs ESP32-S3 4G LTE A7670 (under test)
+│   ├── waveshare_s3.h                   ← Waveshare ESP32-S3 4G LTE (confirmed field unit)
+│   └── makerfabs_a7670.h               ← Makerfabs ESP32-S3 4G LTE A7670 (under test)
 └── OURWater_Expansion/
-    └── OURWater_Expansion.ino  ← Super Mini satellite node (separate flash target)
+    └── OURWater_Expansion.ino           ← Super Mini satellite node (separate flash target)
+
+OURWater_SuperMini/                      ← Separate library folder (same repo root)
+├── board_config.h                       ← Per-board WiFi/MQTT/Supabase credentials
+└── OURWater_SuperMini.ino               ← Standalone WiFi-only node SM-1.0.0
 ```
 
 ---
@@ -215,7 +219,8 @@ Bot subscribes to `ourwater/#` (wildcard, QoS 1).
 |------|------|
 | Arduino CLI | `C:\Users\erick\arduino-cli\arduino-cli.exe` |
 | Board FQBN | `esp32:esp32:esp32s3` |
-| Main board port | COM5 |
+| COM5 | Main boards (Waveshare/Makerfabs) — LTE modem + expansion |
+| COM6 | SuperMini standalone (OURWater_SuperMini.ino) |
 | Git | `C:\Program Files\Git\cmd\git.exe` |
 
 **Compile main firmware:**
@@ -228,14 +233,73 @@ arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater"
 arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater\OURWater_Expansion"
 ```
 
-**Upload:**
+**Compile SuperMini standalone:**
+```
+arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater_SuperMini"
+```
+
+**Upload main firmware:**
 ```
 arduino-cli upload --fqbn esp32:esp32:esp32s3 -p COM5 "...\OURWater"
+```
+
+**Upload SuperMini:**
+```
+arduino-cli upload --fqbn esp32:esp32:esp32s3 -p COM6 "...\OURWater_SuperMini"
 ```
 
 **Kill stale arduino-cli before flash:**
 ```
 taskkill /F /IM arduino-cli.exe
+```
+
+---
+
+## SuperMini Standalone Firmware (`OURWater_SuperMini/`)
+
+A separate firmware for ESP32-S3 Super Mini boards deployed **without** a main board — WiFi only via USB 4G dongle hotspot, no LTE modem.
+
+### Pin Assignments
+
+```
+FLOW_1_PIN        = 10   INPUT_PULLUP — ESP-IDF ISR NEGEDGE (not Arduino attachInterrupt)
+VALVE_1_OPEN      = 11   OUTPUT relay — open
+VALVE_1_CLOSE     = 12   OUTPUT relay — close
+SOLAR_VOLTAGE_PIN =  3   ADC
+BATTERY_24V_PIN   =  4   ADC
+DONGLE_BUTTON_PIN =  5   OUTPUT — transistor drives USB dongle power button
+STATUS_LED_PIN    = 13   OUTPUT
+BATTERY_SDA       =  6   I2C SDA — MAX17048
+BATTERY_SCL       =  7   I2C SCL — MAX17048
+```
+
+### Key Differences from Main Firmware
+
+| | OURWater.ino | OURWater_SuperMini.ino |
+|---|---|---|
+| Connectivity | LTE SIM modem (UART) | WiFi via USB 4G dongle |
+| Dongle management | None | Power-cycles dongle via GPIO5 transistor |
+| Flow ISR | Arduino `attachInterrupt()` | ESP-IDF `gpio_isr_handler_add()` — Arduino API silently fails on this variant |
+| TLS | `setCACert(CA_CERT)` | `setInsecure()` — EMQX Serverless uses own CA |
+| `total_1` | Published (cumulative) | Not published — only `flow_1` (interval delta) |
+| Publish interval | Configurable via MQTT | 30 min (TEST_MODE=false) / 1 min (TEST_MODE=true) |
+| Dongle cycle | — | Configurable via Supabase `dongle_cycle_interval_min` |
+
+### Payload Fields
+
+`flow_1`, `valve_1`, `battery_pct`, `battery_v`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s`
+
+### `board_config.h` (per-unit file, edit before flash)
+
+```cpp
+#define WIFI_SSID      "..."
+#define WIFI_PASS      "..."
+#define MQTT_CLIENT    "ourwater_sm_001"   // unique per board
+#define BASE_TOPIC     "ourwater/<client>/<site>"
+#define SERIAL_NO      "OW-SM-001"
+#define TEST_MODE      false               // true = 1 min publish, false = 30 min
+// MQTT_BROKER, MQTT_PORT, MQTT_USER, MQTT_PASS — shared, do not change
+// SUPABASE_URL, SUPABASE_KEY — for fetching dongle timing on boot
 ```
 
 ---
@@ -248,3 +312,6 @@ taskkill /F /IM arduino-cli.exe
 | Makerfabs modem pins not confirmed against schematic | TODO before field deployment |
 | Makerfabs ADC divider scales copied from Waveshare | TODO — measure actual PCB resistors |
 | `HAS_EXPANSION` not yet wired on either board | Future — main board UART to Super Mini not connected |
+| Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed on COM6, serial OW-SM-001. See `OURWater_SuperMini/` folder. |
+| `attachInterrupt()` silent failure on ESP32-S3 Super Mini | Fixed — ISR never fires with Arduino API on this variant. Fix: ESP-IDF `gpio_install_isr_service(0)` + `gpio_isr_handler_add()` with `void IRAM_ATTR handler(void* arg)` |
+| EMQX Serverless TLS CA mismatch | Fixed — EMQX Serverless uses its own CA; `setCACert(DigiCert)` fails. Fix: `secureClient.setInsecure()` (still TLS-encrypted) |
