@@ -218,39 +218,43 @@ Bot subscribes to `ourwater/#` (wildcard, QoS 1).
 | Tool | Path |
 |------|------|
 | Arduino CLI | `C:\Users\erick\arduino-cli\arduino-cli.exe` |
-| Board FQBN | `esp32:esp32:esp32s3` |
-| COM5 | Main boards (Waveshare/Makerfabs) — LTE modem + expansion |
-| COM6 | SuperMini standalone (OURWater_SuperMini.ino) |
+| Board FQBN | `esp32:esp32:esp32s3:CDCOnBoot=cdc` |
+| Main board COM port | Varies — run `arduino-cli board list` to confirm (has been COM5, COM6, COM7) |
+| SuperMini COM port | Separate port — run `arduino-cli board list` to confirm |
 | Git | `C:\Program Files\Git\cmd\git.exe` |
+
+> **Important — FQBN must include `CDCOnBoot=cdc`.**  Without it, `Serial` output
+> routes to hardware UART0 pins (GPIO43/44), not the USB port — the serial monitor
+> shows nothing. This flag is required for all ESP32-S3 boards in this project.
 
 **Compile main firmware:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater"
 ```
 
 **Compile expansion node:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater\OURWater_Expansion"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater\OURWater_Expansion"
 ```
 
 **Compile SuperMini standalone:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3 "...\OURWater_SuperMini"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater_SuperMini"
 ```
 
-**Upload main firmware:**
+**Upload main firmware (replace COMx with actual port):**
 ```
-arduino-cli upload --fqbn esp32:esp32:esp32s3 -p COM5 "...\OURWater"
-```
-
-**Upload SuperMini:**
-```
-arduino-cli upload --fqbn esp32:esp32:esp32s3 -p COM6 "...\OURWater_SuperMini"
+arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p COMx "...\OURWater"
 ```
 
-**Kill stale arduino-cli before flash:**
+**Upload SuperMini (replace COMx with actual port):**
 ```
-taskkill /F /IM arduino-cli.exe
+arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p COMx "...\OURWater_SuperMini"
+```
+
+**Before every flash — kill stale arduino-cli processes (PowerShell):**
+```powershell
+Get-Process | Where-Object {$_.Name -match "arduino"} | Stop-Process -Force
 ```
 
 ---
@@ -312,6 +316,69 @@ BATTERY_SCL       =  7   I2C SCL — MAX17048
 | Makerfabs modem pins not confirmed against schematic | TODO before field deployment |
 | Makerfabs ADC divider scales copied from Waveshare | TODO — measure actual PCB resistors |
 | `HAS_EXPANSION` not yet wired on either board | Future — main board UART to Super Mini not connected |
+| **Makerfabs modem silent on USB-only power — under investigation** | Open — see section below |
 | Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed on COM6, serial OW-SM-001. See `OURWater_SuperMini/` folder. |
 | `attachInterrupt()` silent failure on ESP32-S3 Super Mini | Fixed — ISR never fires with Arduino API on this variant. Fix: ESP-IDF `gpio_install_isr_service(0)` + `gpio_isr_handler_add()` with `void IRAM_ATTR handler(void* arg)` |
 | EMQX Serverless TLS CA mismatch | Fixed — EMQX Serverless uses its own CA; `setCACert(DigiCert)` fails. Fix: `secureClient.setInsecure()` (still TLS-encrypted) |
+
+---
+
+## Modem USB-Only Power Investigation (Makerfabs A7670)
+
+**Status: unresolved — needs senior developer review**
+
+### Background
+
+The Makerfabs ESP32-S3 4G LTE A7670 board was confirmed **working on USB power alone** (no 24V battery) in at least one prior session. After firmware changes in commit `6a4b9ad` (which reduced the modem cold-boot wait from ~7 s to 2.3 s and enabled CDCOnBoot), the modem stopped responding entirely.
+
+### What was tried
+
+All of the following produced **zero bytes from the modem** across multiple board power-cycles and USB replug cycles:
+
+| Test | Result |
+|------|--------|
+| Original MODEM_RX=17, MODEM_TX=18 at 115200 baud | 0 bytes |
+| Swapped MODEM_RX=18, MODEM_TX=17 | 0 bytes |
+| Baud scan: 9600, 19200, 57600, 115200, 230400 | 0 bytes at all rates |
+| Full GPIO RX scan: every safe GPIO 0–48 (excl. 19,20,43,44,45,46) as RX with TX=17 | 0 bytes on all |
+| Full GPIO power pin scan: GPIOs 4,5,10,14,21,33,47,48 as modem power/PWRKEY | 0 bytes on all |
+| 500ms LOW → 8s HIGH cycle on MODEM_POWER before AT commands | 0 bytes |
+
+### Current `modemPowerOn()` implementation
+
+```cpp
+void modemPowerOn() {
+    Serial.println("[Modem] Powering on...");
+    modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    // LOW→HIGH rising edge triggers the modem auto-start circuit.
+    digitalWrite(MODEM_POWER, LOW);
+    delay(500);
+    digitalWrite(MODEM_POWER, HIGH);
+    for (int i = 0; i < 80; i++) { delay(100); yield(); }   // 8s cold-boot
+    Serial.println("[Modem] Power on complete");
+}
+```
+
+`setup()` asserts `MODEM_POWER HIGH` before anything else so the 24V boost
+circuit is never left floating. `modemPowerOn()` then pulls it LOW to create
+the rising edge the A7670 PWRKEY auto-start circuit requires.
+
+### Hypotheses for senior dev
+
+1. **PWRKEY circuit timing**: The A7670 PWRKEY pin has different hold-time requirements for power-on vs power-off. If `MODEM_POWER` (GPIO33) maps to both VBAT-enable and PWRKEY simultaneously, a 3s LOW may trigger a power-off rather than a reset. The schematic for the Makerfabs PCB has **not been obtained or verified** — the header file says "modem pins not yet confirmed against schematic".
+
+2. **Firmware regression in `6a4b9ad`**: That commit reduced `modemPowerOn()` wait from ~7 s to 2.3 s. Sending AT commands during A7670 boot can leave the modem in a silent unresponsive state that persists across soft resets. A full board power-cycle (USB unplug) should clear this — but if the module has a supercap that holds charge, it may not.
+
+3. **CDCOnBoot interaction**: `CDCOnBoot=cdc` enables the USB CDC stack early in boot. It's possible this creates brief noise on GPIO pins the A7670 interprets as PWRKEY activity. This is speculative.
+
+4. **GPIO33 behaviour at boot**: ESP32-S3 GPIO33 may be driven HIGH by the chip's internal pull during POR (power-on reset), which could suppress the PWRKEY rising-edge that the A7670 needs. The `setup()` `HIGH` guard was added to prevent a different issue (boost circuit floating) and may have introduced this.
+
+5. **USB-only current budget**: The A7670 peak transmit current is ~2A. USB 2.0 provides 500mA; USB 3.0 provides 900mA. If the modem is drawing more than the port allows, it may boot and immediately shut down. The board supposedly worked previously — so this may be a marginal or intermittent issue.
+
+### Recommended next steps
+
+- Obtain and verify the Makerfabs A7670 board schematic — specifically which ESP32 GPIOs connect to A7670 PWRKEY, VBAT/VDDEXT, and STATUS
+- Measure GPIO33 voltage with a multimeter at boot (before `setup()` runs — power on with no firmware or a bare blink sketch)
+- Use a USB power meter to measure current draw when modem is supposed to start
+- Try `modemPowerOn()` with a 2.5s LOW pulse (matches SIM7600 PWRKEY spec exactly) instead of 500ms
+- Test with a fresh flash of the **last known working firmware state** (before `6a4b9ad`) to isolate whether this is a firmware or hardware regression
