@@ -628,13 +628,15 @@ void checkIncoming() {
 }
 
 // ─── Modem power ──────────────────────────────────────────────────────────────
+
 void modemPowerOn() {
     Serial.println("[Modem] Powering on...");
-    pinMode(MODEM_POWER, OUTPUT);
-    digitalWrite(MODEM_POWER, HIGH);
-    for (int i = 0; i < 20; i++) { delay(100); yield(); }   // 2s; networkInit AT poll covers the rest
     modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-    delay(300);
+    // LOW→HIGH rising edge triggers the modem auto-start circuit.
+    digitalWrite(MODEM_POWER, LOW);
+    delay(500);
+    digitalWrite(MODEM_POWER, HIGH);
+    for (int i = 0; i < 80; i++) { delay(100); yield(); }   // 8s cold-boot
     Serial.println("[Modem] Power on complete");
 }
 
