@@ -632,9 +632,9 @@ void modemPowerOn() {
     Serial.println("[Modem] Powering on...");
     pinMode(MODEM_POWER, OUTPUT);
     digitalWrite(MODEM_POWER, HIGH);
-    for (int i = 0; i < 80; i++) { delay(100); yield(); }
+    for (int i = 0; i < 20; i++) { delay(100); yield(); }   // 2s; networkInit AT poll covers the rest
     modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-    delay(1000);
+    delay(300);
     Serial.println("[Modem] Power on complete");
 }
 
@@ -703,10 +703,10 @@ void loadCACert() {
 // ─── Network init ─────────────────────────────────────────────────────────────
 bool networkInit() {
     Serial.print("[Modem] Waiting for AT");
-    for (int i = 0; i < 30; i++) {
-        if (sendAT("AT", "OK", 1000).indexOf("OK") >= 0) { Serial.println(" OK"); break; }
-        if (i == 29) { Serial.println(" FAILED"); return false; }
-        Serial.print("."); delay(500);
+    for (int i = 0; i < 20; i++) {
+        if (sendAT("AT", "OK", 500).indexOf("OK") >= 0) { Serial.println(" OK"); break; }
+        if (i == 19) { Serial.println(" FAILED"); return false; }
+        Serial.print("."); delay(200);
     }
     sendAT("ATE0",     "OK", 2000);
     sendAT("AT+CMEE=2","OK", 2000);
@@ -721,8 +721,8 @@ bool networkInit() {
     sendAT("AT+CSQ",   "OK", 2000);
     sendAT("AT+COPS?", "OK", 2000);
 
-    sendAT("AT+NETCLOSE", "+NETCLOSE", 15000);
-    delay(2000);
+    sendAT("AT+NETCLOSE", "+NETCLOSE", 5000);
+    delay(500);
     if (sendAT("AT+NETOPEN", "+NETOPEN: 0", 15000).indexOf("+NETOPEN: 0") < 0) {
         Serial.println("[Network] NETOPEN failed"); return false;
     }
@@ -732,11 +732,11 @@ bool networkInit() {
     }
 
     Serial.println("[DNS] Resolving broker...");
-    sendAT("AT+CDNSGIP=\"g7214f51.ala.eu-central-1.emqxsl.com\"", "+CDNSGIP", 10000);
+    sendAT("AT+CDNSGIP=\"g7214f51.ala.eu-central-1.emqxsl.com\"", "+CDNSGIP", 5000);
 
     Serial.println("[NTP] Syncing...");
-    sendAT("AT+CNTP=\"pool.ntp.org\",0", "OK", 5000);
-    sendAT("AT+CNTP", "+CNTP", 10000);
+    sendAT("AT+CNTP=\"pool.ntp.org\",0", "OK", 3000);
+    sendAT("AT+CNTP", "+CNTP", 5000);
     String clockResp = sendAT("AT+CCLK?", "OK", 2000);
     ntpSecondsOfDay  = parseClockToSecondsOfDay(clockResp);
     ntpBootMs        = millis();
@@ -756,7 +756,7 @@ bool networkInit() {
 // ─── MQTT connect ─────────────────────────────────────────────────────────────
 bool mqttConnect() {
     Serial.println("[Net] Checking connectivity...");
-    if (sendAT("AT+CDNSGIP=\"google.com\"", "+CDNSGIP: 1", 10000).indexOf("+CDNSGIP: 1") < 0) {
+    if (sendAT("AT+CDNSGIP=\"google.com\"", "+CDNSGIP: 1", 5000).indexOf("+CDNSGIP: 1") < 0) {
         Serial.println("[Net] DNS failed — skipping MQTT"); return false;
     }
     Serial.println("[Net] Internet OK");
