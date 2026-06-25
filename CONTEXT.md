@@ -267,7 +267,7 @@ A separate firmware for ESP32-S3 Super Mini boards deployed **without** a main b
 
 ```
 FLOW_1_PIN        = 10   INPUT_PULLUP — ESP-IDF ISR NEGEDGE (not Arduino attachInterrupt)
-VALVE_1_OPEN      = 11   OUTPUT relay — open
+VALVE_1_OPEN      =  8   OUTPUT relay — open  (was 11; GPIO11 confirmed faulty on test board)
 VALVE_1_CLOSE     = 12   OUTPUT relay — close
 SOLAR_VOLTAGE_PIN =  3   ADC
 BATTERY_24V_PIN   =  4   ADC
@@ -288,6 +288,7 @@ BATTERY_SCL       =  7   I2C SCL — MAX17048
 | `total_1` | Published (cumulative) | Not published — only `flow_1` (interval delta) |
 | Publish interval | Configurable via MQTT | 30 min (TEST_MODE=false) / 1 min (TEST_MODE=true) |
 | Dongle cycle | — | Configurable via Supabase `dongle_cycle_interval_min` |
+| Wall-clock time | NTP not implemented | SNTP via `configTime(UTC+2)` — synced on every WiFi connect; 10 s bounded wait; accessor `getLocalTimeNow()` |
 
 ### Payload Fields
 
@@ -317,9 +318,11 @@ BATTERY_SCL       =  7   I2C SCL — MAX17048
 | Makerfabs ADC divider scales copied from Waveshare | TODO — measure actual PCB resistors |
 | `HAS_EXPANSION` not yet wired on either board | Future — main board UART to Super Mini not connected |
 | **Makerfabs modem silent on USB-only power — under investigation** | Open — see section below |
-| Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed on COM6, serial OW-SM-001. See `OURWater_SuperMini/` folder. |
+| Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed on COM7, serial OW-SM-001. See `OURWater_SuperMini/` folder. |
 | `attachInterrupt()` silent failure on ESP32-S3 Super Mini | Fixed — ISR never fires with Arduino API on this variant. Fix: ESP-IDF `gpio_install_isr_service(0)` + `gpio_isr_handler_add()` with `void IRAM_ATTR handler(void* arg)` |
 | EMQX Serverless TLS CA mismatch | Fixed — EMQX Serverless uses its own CA; `setCACert(DigiCert)` fails. Fix: `secureClient.setInsecure()` (still TLS-encrypted) |
+| VALVE_1_OPEN on GPIO11 (faulty) | Fixed — GPIO11 confirmed faulty on test board. Reassigned to GPIO8. |
+| SuperMini had no wall-clock time | Fixed — SNTP added via `configTime(UTC+2, 0, "pool.ntp.org", "time.google.com")`. Syncs on every WiFi connect. Bounded 10 s wait; `getLocalTimeNow()` accessor for schedule code. Botswana = UTC+2, no DST. |
 
 ---
 

@@ -15,6 +15,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <time.h>
 #include "driver/gpio.h"
 #include "board_config.h"
 
@@ -91,6 +92,8 @@ uint32_t dongleOffDurationMin   = 5;
 
 uint32_t lastPublishMs     = 0;
 uint32_t lastDongleCycleMs = 0;
+
+bool timeSynced = false;
 
 Preferences      prefs;
 WiFiClientSecure secureClient;
@@ -329,6 +332,27 @@ void fetchDongleSettings() {
     http.end();
 }
 
+// ─── SNTP time sync (Botswana = UTC+2, no DST) ───────────────────────────────
+void syncTime() {
+    configTime(2 * 3600, 0, "pool.ntp.org", "time.google.com");
+    struct tm timeinfo;
+    uint32_t start = millis();
+    while (!getLocalTime(&timeinfo) && millis() - start < 10000) delay(200);
+    if (getLocalTime(&timeinfo)) {
+        timeSynced = true;
+        Serial.printf("[NTP] Synced: %04d-%02d-%02d %02d:%02d:%02d (local, UTC+2)\n",
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+        Serial.println("[NTP] Sync failed — continuing without wall-clock time");
+    }
+}
+
+bool getLocalTimeNow(struct tm &out) {
+    if (!timeSynced) return false;
+    return getLocalTime(&out);
+}
+
 // ─── WiFi connect ─────────────────────────────────────────────────────────────
 bool connectWiFi() {
     Serial.print("[WiFi] Connecting to " WIFI_SSID);
@@ -341,6 +365,7 @@ bool connectWiFi() {
     }
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] Connected  IP=%s\n", WiFi.localIP().toString().c_str());
+        syncTime();
         return true;
     }
     Serial.println("\n[WiFi] Connect failed");

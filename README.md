@@ -80,10 +80,12 @@ OURWater/
 ├── boards/
 │   ├── waveshare_s3.h        Pin definitions — Waveshare board
 │   └── makerfabs_a7670.h     Pin definitions — Makerfabs board (under test)
-└── OURWater_Expansion/
-    └── OURWater_Expansion.ino  Satellite node firmware (ESP32-S3 Super Mini)
+├── OURWater_Expansion/
+│   └── OURWater_Expansion.ino  Satellite node firmware (ESP32-S3 Super Mini)
+└── OURWater_SuperMini/
+    └── OURWater_SuperMini.ino  Mirror of the standalone SuperMini firmware (source of truth: OURWater_SuperMini/)
 
-OURWater_SuperMini/           Standalone WiFi-only node (no LTE modem)
+OURWater_SuperMini/           Standalone WiFi-only node (no LTE modem) — source of truth
 ├── OURWater_SuperMini.ino
 └── board_config.h
 ```
@@ -101,6 +103,22 @@ OURWater_SuperMini/           Standalone WiFi-only node (no LTE modem)
 | `<BASE_TOPIC>/valve/1/cmd` | Broker → board | `open` / `close` / `stop` |
 | `<BASE_TOPIC>/valve/2/cmd` | Broker → board | `open` / `close` / `stop` |
 | `<BASE_TOPIC>/config/interval` | Broker → board | Publish interval in minutes |
+
+---
+
+## SuperMini — Key Facts
+
+| Property | Value |
+|----------|-------|
+| Board | ESP32-S3 Super Mini |
+| Connectivity | WiFi via USB 4G dongle hotspot |
+| VALVE_1_OPEN | GPIO **8** (GPIO11 was faulty on test board) |
+| VALVE_1_CLOSE | GPIO 12 |
+| FLOW_1 | GPIO 10 — ESP-IDF ISR (Arduino `attachInterrupt` silently fails on this variant) |
+| Time sync | SNTP on every WiFi connect — `configTime(UTC+2)`, 10 s bounded wait |
+| Timestamps | Board sets Botswana local time (UTC+2, no DST); bot.py uses its own `datetime.now(UTC)` for DB rows |
+| Publish interval | 30 min (`TEST_MODE=false`) / 1 min (`TEST_MODE=true`) |
+| Dongle cycle | Configurable — `dongle_cycle_interval_min` in Supabase `meters` table |
 
 ---
 
