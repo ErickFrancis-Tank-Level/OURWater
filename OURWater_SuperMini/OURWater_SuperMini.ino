@@ -16,6 +16,7 @@
 #include <Preferences.h>
 #include <time.h>
 #include "driver/gpio.h"
+#include "esp_task_wdt.h"
 #include "board_config.h"
 
 #define FIRMWARE_VER    "SM-1.0.0"
@@ -23,7 +24,7 @@
 
 // ─── Pin assignments ──────────────────────────────────────────────────────────
 #define FLOW_1_PIN         10
-#define VALVE_1_OPEN        8
+#define VALVE_1_OPEN       11
 #define VALVE_1_CLOSE      12
 #define SOLAR_VOLTAGE_PIN   3
 #define BATTERY_24V_PIN     4
@@ -388,6 +389,8 @@ bool mqttReconnect() {
         fetchDongleSettings();
     }
 
+    secureClient.setTimeout(10);   // 10 s hard limit on TLS handshake
+    esp_task_wdt_reset();          // TLS handshake can block > WDT window — reset before entering
     Serial.print("[MQTT] Connecting...");
     bool ok = mqttClient.connect(
         MQTT_CLIENT, MQTT_USER, MQTT_PASS,
@@ -454,11 +457,25 @@ void doDongleCycle() {
     // Step 5 — reconnect WiFi
     WiFi.disconnect();
     delay(1000);
-    connectWiFi();
+    bool wifiOk = connectWiFi();
 
-    // Step 6 — reconnect MQTT
-    if (!mqttReconnect()) {
-        Serial.println("[Dongle] MQTT reconnect failed — will retry in loop");
+    // Step 6 — reconnect MQTT (WiFi already attempted above; skip re-check in mqttReconnect)
+    if (wifiOk) {
+        secureClient.setTimeout(10);
+        esp_task_wdt_reset();
+        if (!mqttClient.connect(
+                MQTT_CLIENT, MQTT_USER, MQTT_PASS,
+                BASE_TOPIC "/status", 1, true, "{\"status\":\"offline\"}")) {
+            Serial.printf("[Dongle] MQTT connect failed rc=%d — will retry in loop\n", mqttClient.state());
+        } else {
+            Serial.println("[Dongle] MQTT reconnected OK");
+            mqttClient.subscribe(BASE_TOPIC "/#");
+            skipNextValveCmd = true;
+            publishStatus("online");
+            setLedMode(LED_CONNECTED);
+        }
+    } else {
+        Serial.println("[Dongle] WiFi failed — MQTT will retry in loop");
     }
 }
 
