@@ -34,17 +34,20 @@
 #define BATTERY_SCL         7   // free — was MAX17048, removed
 
 // ─── ADC calibration — 12V LiFePO4 pack + 3× parallel 10W panels ────────────
-// VERIFY THESE against a multimeter — see [CAL] print in setup().
-// true_scale = V_multimeter / (pin_mV / 1000.0)
-#define BATT_ADC_SCALE   11.0f   // start value; correct after measuring
-#define SOLAR_ADC_SCALE  11.0f   // start value; correct after measuring
-
-// 12V LiFePO4 (4S)
-#define BATT_FULL_V    13.6f     // resting full (~100%)
-#define BATT_EMPTY_V   11.0f     // ~0% display knee (BMS handles true cell-empty)
+// true_scale = V_multimeter / (pin_mV / 1000.0)  — see [CAL] print in setup()
+// Calibrated 2026-06-25: true=13.14V, pin≈2381mV, scale=13.14/2.381=5.52
+#define BATT_ADC_SCALE   5.52f
+#define SOLAR_ADC_SCALE  11.0f   // not yet calibrated — verify with multimeter
 
 // 3× 36-cell panels in parallel — Voc ~22V
 #define SOLAR_MAX_V    22.0f
+
+// ─── Load-shedding tier thresholds (resting voltage, measured DONGLE-OFF) ────
+// NOTE: ADC reads in this firmware are taken with dongle ON — ~0.1-0.2V sag
+// compensation may be needed for precision tier decisions.
+#define BATT_CONSERVE_V      12.5f   // 15% — shed publish windows, hourly only
+#define BATT_CRITICAL_V      12.2f   //  8% — dongle off, status only
+#define BATT_VALVE_RESERVE_V 11.8f   //  3% — dongle off, valve only, 1×/day
 
 // ─── RGB status LED (WS2812B GPIO48) — enum must be before Arduino hoists prototypes ──
 enum LedMode : uint8_t { LED_DISCONNECTED, LED_CONNECTED, LED_DONGLING };
@@ -170,21 +173,20 @@ float readBattery24V() {
     return v;
 }
 
-// Piecewise-linear LiFePO4 SoC from resting voltage.
-// Points are APPROXIMATE for 4S LFP — refine against real pack data later.
+// Piecewise-linear LiFePO4 SoC. Returns 0-110; >100 means charger connected.
 int batteryLFPPercent(float v) {
-    static const float volts[] = {10.5f,11.5f,12.0f,12.4f,12.6f,12.8f,12.9f,13.0f,13.1f,13.2f,13.3f,13.4f,13.6f};
-    static const int   pcts[]  = {  0,    5,    9,   13,   20,   30,   40,   50,   60,   75,   90,   95,  100};
-    const int n = 13;
+    static const float volts[] = {10.5f, 11.8f, 12.2f, 12.5f, 12.8f, 13.0f, 13.2f, 13.4f, 13.8f};
+    static const int   pcts[]  = {   0,     3,     8,    15,    25,    50,    80,   100,   110};
+    const int n = 9;
     if (v <= volts[0])   return 0;
-    if (v >= volts[n-1]) return 100;
+    if (v >= volts[n-1]) return 110;
     for (int i = 1; i < n; i++) {
         if (v < volts[i]) {
             float frac = (v - volts[i-1]) / (volts[i] - volts[i-1]);
             return (int)(pcts[i-1] + frac * (pcts[i] - pcts[i-1]));
         }
     }
-    return 100;
+    return 110;
 }
 
 int solarVoltageToPercent(float v) {
