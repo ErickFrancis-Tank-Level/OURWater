@@ -93,7 +93,8 @@ uint32_t dongleOffDurationMin   = 5;
 uint32_t lastPublishMs     = 0;
 uint32_t lastDongleCycleMs = 0;
 
-bool timeSynced = false;
+bool timeSynced        = false;
+bool skipNextValveCmd  = false;   // true after each subscribe; blocks the retained cmd replay
 
 Preferences      prefs;
 WiFiClientSecure secureClient;
@@ -234,6 +235,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] Rcv: %s | %s\n", topic, msg);
 
     if (t.endsWith("/valve/1/cmd")) {
+        if (skipNextValveCmd) {
+            skipNextValveCmd = false;
+            Serial.printf("[Valve] Ignoring retained cmd on reconnect: %s\n", msg);
+            return;
+        }
         safeSetValve(p);
     } else if (t.endsWith("/config/dongle_cycle")) {
         int val = p.toInt();
@@ -353,6 +359,7 @@ bool mqttReconnect() {
     if (ok) {
         Serial.println(" OK");
         mqttClient.subscribe(BASE_TOPIC "/#");
+        skipNextValveCmd = true;   // ignore retained cmd replayed by broker on (re)connect
         publishStatus("online");
         digitalWrite(STATUS_LED_PIN, HIGH);
         // Only publish on first connect or if the full interval has already elapsed.
