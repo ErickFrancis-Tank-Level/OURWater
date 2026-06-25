@@ -17,6 +17,7 @@
 #include <time.h>
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "board_config.h"
 
 #define FIRMWARE_VER    "SM-1.0.0"
@@ -105,14 +106,17 @@ const char* CA_CERT =
 "-----END CERTIFICATE-----\n";
 
 // ─── Flow ISR ────────────────────────────────────────────────────────────────
-volatile uint32_t pulseCount  = 0;
-volatile uint32_t lastFlowMs  = 0;
+RTC_NOINIT_ATTR uint32_t pulseCount;
+RTC_NOINIT_ATTR uint32_t pulseCountMagic;
+static const uint32_t    PULSE_MAGIC = 0x4F574C57;   // 'OWLW' sentinel — OURWater flow
+
+volatile int64_t lastFlowUs = 0;   // debounce timestamp — plain RAM, reset on every boot is fine
 
 void IRAM_ATTR onFlow1(void* arg) {
-    uint32_t n = millis();
-    if (n - lastFlowMs > 50) {
+    int64_t n = esp_timer_get_time();        // microseconds, IRAM-safe unlike millis()
+    if (n - lastFlowUs > 50000) {            // 50 ms debounce
         pulseCount++;
-        lastFlowMs = n;
+        lastFlowUs = n;
     }
 }
 
@@ -497,6 +501,16 @@ void setup() {
     Serial.println("\n=============================");
     Serial.println(" OURWater Super Mini v" FIRMWARE_VER);
     Serial.println("=============================");
+
+    // Validate RTC-retained pulse count. On a cold/power-on boot the RTC RAM
+    // contains garbage, so guard with a magic marker before trusting the value.
+    if (pulseCountMagic != PULSE_MAGIC) {
+        pulseCount      = 0;
+        pulseCountMagic = PULSE_MAGIC;
+        Serial.println("[Flow] Cold boot — pulse count reset to 0");
+    } else {
+        Serial.printf("[Flow] Warm boot — retained pulse count = %lu\n", (unsigned long)pulseCount);
+    }
 
     // Flow sensor — use ESP-IDF GPIO driver directly; Arduino attachInterrupt()
     // silently fails on this Super Mini variant.
