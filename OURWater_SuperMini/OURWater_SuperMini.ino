@@ -14,7 +14,6 @@
 #include <PubSubClient.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <Wire.h>
 #include <time.h>
 #include "driver/gpio.h"
 #include "board_config.h"
@@ -30,15 +29,21 @@
 #define BATTERY_24V_PIN     4
 #define DONGLE_BUTTON_PIN   5
 #define STATUS_LED_PIN     13
-#define BATTERY_SDA         6
-#define BATTERY_SCL         7
+#define BATTERY_SDA         6   // free — was MAX17048, removed
+#define BATTERY_SCL         7   // free — was MAX17048, removed
 
-// ─── ADC calibration (same formulas as OURWater.ino) ─────────────────────────
-#define SOLAR_ADC_SCALE   28.1f
-#define BATT24V_ADC_SCALE 11.0f
-#define BATT24V_FULL_V    25.6f
-#define BATT24V_EMPTY_V   21.0f
-#define SOLAR_MAX_V       40.0f
+// ─── ADC calibration — 12V LiFePO4 pack + 3× parallel 10W panels ────────────
+// VERIFY THESE against a multimeter — see [CAL] print in setup().
+// true_scale = V_multimeter / (pin_mV / 1000.0)
+#define BATT_ADC_SCALE   11.0f   // start value; correct after measuring
+#define SOLAR_ADC_SCALE  11.0f   // start value; correct after measuring
+
+// 12V LiFePO4 (4S)
+#define BATT_FULL_V    13.6f     // resting full (~100%)
+#define BATT_EMPTY_V   11.0f     // ~0% display knee (BMS handles true cell-empty)
+
+// 3× 36-cell panels in parallel — Voc ~22V
+#define SOLAR_MAX_V    22.0f
 
 // ─── CA certificate (DigiCert Global Root G2 — same as OURWater.ino) ─────────
 const char* CA_CERT =
@@ -82,11 +87,6 @@ enum ValveState : uint8_t { VALVE_STOPPED, VALVE_OPENING, VALVE_CLOSING, VALVE_O
 ValveState valve1State     = VALVE_STOPPED;
 uint32_t   valve1MoveStartMs = 0;
 
-uint8_t max17048Addr = 0x36;
-float   battPct      = 0.0f;
-float   battVoltage  = 0.0f;
-bool    battGaugeOk  = false;
-
 uint32_t dongleCycleIntervalMin = 60;
 uint32_t dongleOffDurationMin   = 5;
 
@@ -105,76 +105,51 @@ void waitSeconds(uint32_t seconds) {
     for (uint32_t i = 0; i < seconds; i++) delay(1000);
 }
 
-// ─── MAX17048 battery gauge (same logic as OURWater.ino) ─────────────────────
-bool probeMAX17048() {
-    Wire.beginTransmission(0x36);
-    if (Wire.endTransmission() == 0) { max17048Addr = 0x36; return true; }
-    return false;
-}
-
-bool readMAX17048(float &pct, float &voltage) {
-    Wire.beginTransmission(max17048Addr);
-    Wire.write(0x02);                               // VCELL register
-    if (Wire.endTransmission(false) != 0) return false;
-    Wire.requestFrom(max17048Addr, (uint8_t)2);
-    if (Wire.available() < 2) return false;
-    uint16_t rawV = ((uint16_t)Wire.read() << 8) | Wire.read();
-    voltage = rawV * 1.25f / 1000.0f;              // 1.25 mV per LSB
-
-    Wire.beginTransmission(max17048Addr);
-    Wire.write(0x04);                               // SOC register
-    Wire.endTransmission(false);
-    Wire.requestFrom(max17048Addr, (uint8_t)2);
-    if (Wire.available() < 2) return false;
-    pct = (float)Wire.read() + (float)Wire.read() / 256.0f;
-    return true;
-}
-
-void updateBattery() {
-    if (!battGaugeOk && !probeMAX17048()) return;
-    float p = battPct, v = battVoltage;
-    if (!readMAX17048(p, v)) { battGaugeOk = false; return; }
-    battGaugeOk = true;
-    battPct     = p;
-    battVoltage = v;
-    Serial.printf("[MAX17048] %.1f%%  %.3fV\n", battPct, battVoltage);
-}
-
-// ─── ADC voltage reads (same formulas as OURWater.ino) ───────────────────────
-float readSolarVoltage() {
-    pinMode(SOLAR_VOLTAGE_PIN, INPUT);
-    gpio_pullup_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
-    gpio_pulldown_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
+// ─── ADC voltage reads ────────────────────────────────────────────────────────
+static uint32_t adcAvgMv(int pin) {
+    pinMode(pin, INPUT);
+    gpio_pullup_dis((gpio_num_t)pin);
+    gpio_pulldown_dis((gpio_num_t)pin);
     uint32_t sum = 0;
-    for (int i = 0; i < 10; i++) { sum += analogRead(SOLAR_VOLTAGE_PIN); delay(2); }
-    int raw = (int)(sum / 10);
-    if (raw < 100) return 0.0f;
-    float v = raw * 3.3f / 4095.0f * SOLAR_ADC_SCALE;
-    if (v < 10.0f) return 0.0f;
-    Serial.printf("[ADC] Solar  raw=%d  v=%.2fV\n", raw, v);
+    for (int i = 0; i < 10; i++) { sum += analogReadMilliVolts(pin); delay(2); }
+    return sum / 10;
+}
+
+float readSolarVoltage() {
+    uint32_t mv = adcAvgMv(SOLAR_VOLTAGE_PIN);
+    float v = (mv / 1000.0f) * SOLAR_ADC_SCALE;
+    if (v < 6.0f) return 0.0f;
+    Serial.printf("[ADC] Solar  pin=%lumV  v=%.2fV\n", mv, v);
     return v;
 }
 
 float readBattery24V() {
-    pinMode(BATTERY_24V_PIN, INPUT);
-    gpio_pullup_dis((gpio_num_t)BATTERY_24V_PIN);
-    gpio_pulldown_dis((gpio_num_t)BATTERY_24V_PIN);
-    uint32_t sum = 0;
-    for (int i = 0; i < 10; i++) { sum += analogRead(BATTERY_24V_PIN); delay(2); }
-    int raw = (int)(sum / 10);
-    if (raw < 100) return 0.0f;
-    float v = raw * 3.3f / 4095.0f * BATT24V_ADC_SCALE;
-    if (v < 10.0f) return 0.0f;
-    Serial.printf("[ADC] Batt24V raw=%d  v=%.2fV\n", raw, v);
+    uint32_t mv = adcAvgMv(BATTERY_24V_PIN);
+    float v = (mv / 1000.0f) * BATT_ADC_SCALE;
+    if (v < 6.0f) return 0.0f;
+    Serial.printf("[ADC] Battery  pin=%lumV  v=%.2fV\n", mv, v);
     return v;
 }
 
-int voltage24VToPercent(float v) {
-    float pct = (v - BATT24V_EMPTY_V) / (BATT24V_FULL_V - BATT24V_EMPTY_V) * 100.0f;
-    return (int)constrain(pct, 0.0f, 100.0f);
+// Piecewise-linear LiFePO4 SoC from resting voltage.
+// Points are APPROXIMATE for 4S LFP — refine against real pack data later.
+int batteryLFPPercent(float v) {
+    static const float volts[] = {10.5f,11.5f,12.0f,12.4f,12.6f,12.8f,12.9f,13.0f,13.1f,13.2f,13.3f,13.4f,13.6f};
+    static const int   pcts[]  = {  0,    5,    9,   13,   20,   30,   40,   50,   60,   75,   90,   95,  100};
+    const int n = 13;
+    if (v <= volts[0])   return 0;
+    if (v >= volts[n-1]) return 100;
+    for (int i = 1; i < n; i++) {
+        if (v < volts[i]) {
+            float frac = (v - volts[i-1]) / (volts[i] - volts[i-1]);
+            return (int)(pcts[i-1] + frac * (pcts[i] - pcts[i-1]));
+        }
+    }
+    return 100;
 }
 
 int solarVoltageToPercent(float v) {
+    // Rough "panel alive" indicator — true charging state is solar_v vs battery_v server-side.
     return (int)constrain((v / SOLAR_MAX_V) * 100.0f, 0.0f, 100.0f);
 }
 
@@ -223,32 +198,20 @@ void publishData() {
     pulseCount = 0;
     interrupts();
 
-    updateBattery();
     float solarV  = readSolarVoltage();
     float batt24V = readBattery24V();
 
-    char bPctStr[8], bVStr[12];
-    if (battGaugeOk) {
-        snprintf(bPctStr, sizeof(bPctStr), "%d",   (int)battPct);
-        snprintf(bVStr,   sizeof(bVStr),   "%.2f", battVoltage);
-    } else {
-        strcpy(bPctStr, "null");
-        strcpy(bVStr,   "null");
-    }
-
-    char payload[384];
+    char payload[320];
     snprintf(payload, sizeof(payload),
         "{\"flow_1\":%lu,"
         "\"valve_1\":\"%s\","
-        "\"battery_pct\":%s,\"battery_v\":%s,"
         "\"solar_v\":%.2f,\"solar_pct\":%d,"
         "\"battery_24v_v\":%.2f,\"battery_24v_pct\":%d,"
         "\"firmware\":\"%s\",\"uptime_s\":%lu}",
         (unsigned long)pulses,
         valveStateStr(),
-        bPctStr, bVStr,
         solarV,  solarVoltageToPercent(solarV),
-        batt24V, voltage24VToPercent(batt24V),
+        batt24V, batteryLFPPercent(batt24V),
         FIRMWARE_VER,
         (unsigned long)(millis() / 1000)
     );
@@ -490,16 +453,17 @@ void setup() {
     pinMode(STATUS_LED_PIN,    OUTPUT); digitalWrite(STATUS_LED_PIN,    LOW);
     Serial.println("[GPIO] Outputs ready");
 
-    // I2C — MAX17048 battery gauge
-    gpio_set_pull_mode((gpio_num_t)BATTERY_SDA, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode((gpio_num_t)BATTERY_SCL, GPIO_PULLUP_ONLY);
-    Wire.begin(BATTERY_SDA, BATTERY_SCL);
-    Wire.setClock(100000);
-    delay(100);
-    if (probeMAX17048()) {
-        Serial.println("[I2C] MAX17048 found at 0x36");
-    } else {
-        Serial.println("[I2C] MAX17048 not found — will retry in loop");
+    // ADC calibration — set BATT_ADC_SCALE / SOLAR_ADC_SCALE to match real divider.
+    // Procedure: measure true voltage with a multimeter, read pin_mV from serial,
+    // then: true_scale = V_multimeter / (pin_mV / 1000.0)
+    {
+        uint32_t battMv  = adcAvgMv(BATTERY_24V_PIN);
+        uint32_t solarMv = adcAvgMv(SOLAR_VOLTAGE_PIN);
+        Serial.printf("[CAL] Battery: pin=%lumV  scale=%.1f  =>  reported=%.2fV\n",
+                      battMv,  BATT_ADC_SCALE,  (battMv  / 1000.0f) * BATT_ADC_SCALE);
+        Serial.printf("[CAL] Solar:   pin=%lumV  scale=%.1f  =>  reported=%.2fV\n",
+                      solarMv, SOLAR_ADC_SCALE, (solarMv / 1000.0f) * SOLAR_ADC_SCALE);
+        Serial.println("[CAL] To calibrate: true_scale = V_multimeter / (pin_mV / 1000)");
     }
 
     // Load persisted dongle settings (fallback if Supabase unreachable)
