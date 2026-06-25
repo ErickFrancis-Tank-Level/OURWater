@@ -218,7 +218,7 @@ Bot subscribes to `ourwater/#` (wildcard, QoS 1).
 | Tool | Path |
 |------|------|
 | Arduino CLI | `C:\Users\erick\arduino-cli\arduino-cli.exe` |
-| Board FQBN | `esp32:esp32:esp32s3:CDCOnBoot=cdc` |
+| Board FQBN | `esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc` |
 | Main board COM port | Varies — run `arduino-cli board list` to confirm (has been COM5, COM6, COM7) |
 | SuperMini COM port | Separate port — run `arduino-cli board list` to confirm |
 | Git | `C:\Program Files\Git\cmd\git.exe` |
@@ -229,27 +229,27 @@ Bot subscribes to `ourwater/#` (wildcard, QoS 1).
 
 **Compile main firmware:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc "...\OURWater"
 ```
 
 **Compile expansion node:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater\OURWater_Expansion"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc "...\OURWater\OURWater_Expansion"
 ```
 
 **Compile SuperMini standalone:**
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc "...\OURWater_SuperMini"
+arduino-cli compile --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc "...\OURWater_SuperMini"
 ```
 
 **Upload main firmware (replace COMx with actual port):**
 ```
-arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p COMx "...\OURWater"
+arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc -p COMx "...\OURWater"
 ```
 
 **Upload SuperMini (replace COMx with actual port):**
 ```
-arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p COMx "...\OURWater_SuperMini"
+arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc -p COMx "...\OURWater_SuperMini"
 ```
 
 **Before every flash — kill stale arduino-cli processes (PowerShell):**
@@ -267,7 +267,7 @@ A separate firmware for ESP32-S3 Super Mini boards deployed **without** a main b
 
 ```
 FLOW_1_PIN        = 10   INPUT_PULLUP — ESP-IDF ISR NEGEDGE (not Arduino attachInterrupt)
-VALVE_1_OPEN      =  8   OUTPUT relay — open  (was 11; GPIO11 confirmed faulty on test board)
+VALVE_1_OPEN      = 11   OUTPUT relay — open
 VALVE_1_CLOSE     = 12   OUTPUT relay — close
 SOLAR_VOLTAGE_PIN =  3   ADC
 BATTERY_24V_PIN   =  4   ADC
@@ -322,12 +322,13 @@ BATTERY_SCL       =  7   free — was MAX17048, removed
 | Makerfabs ADC divider scales copied from Waveshare | TODO — measure actual PCB resistors |
 | `HAS_EXPANSION` not yet wired on either board | Future — main board UART to Super Mini not connected |
 | **Makerfabs modem silent on USB-only power — under investigation** | Open — see section below |
-| Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed on COM7, serial OW-SM-001. See `OURWater_SuperMini/` folder. |
+| Standalone SuperMini firmware | Fixed — SM-1.0.0 written and deployed, serial OW-SM-001. Enumerates as COM6 (app mode) / COM7 (varies). See `OURWater_SuperMini/` folder. |
 | `attachInterrupt()` silent failure on ESP32-S3 Super Mini | Fixed — ISR never fires with Arduino API on this variant. Fix: ESP-IDF `gpio_install_isr_service(0)` + `gpio_isr_handler_add()` with `void IRAM_ATTR handler(void* arg)` |
 | EMQX Serverless TLS CA mismatch | Fixed — EMQX Serverless uses its own CA; `setCACert(DigiCert)` fails. Fix: `secureClient.setInsecure()` (still TLS-encrypted) |
-| VALVE_1_OPEN on GPIO11 (faulty) | Fixed — GPIO11 confirmed faulty on test board. Reassigned to GPIO8. |
+| VALVE_1_OPEN defined as GPIO8 in firmware | Fixed — GPIO8 was a firmware bug; correct pin per schematic is GPIO11. Reverted. |
 | SuperMini had no wall-clock time | Fixed — SNTP added via `configTime(UTC+2, 0, "pool.ntp.org", "time.google.com")`. Syncs on every WiFi connect. Bounded 10 s wait; `getLocalTimeNow()` accessor for schedule code. Botswana = UTC+2, no DST. |
 | SuperMini power constants copied from 24V lead-acid main board | Fixed — MAX17048 removed (cannot read a 12V pack); constants corrected for 12V LFP 4S + 3× parallel 36-cell panels (Voc ~22V); `analogReadMilliVolts()` replaces raw ADC; LFP piecewise SoC curve; `[CAL]` boot print for scale calibration. **ADC scales still need multimeter verification.** |
+| SuperMini TG0WDT_SYS_RST crash loop on boot | Fixed — `mqttClient.connect()` TLS handshake can block longer than the task watchdog window. Fix: `secureClient.setTimeout(10)` + `esp_task_wdt_reset()` before every blocking MQTT/TLS connect call. Also fixed double `connectWiFi()` in `doDongleCycle()`. |
 
 ---
 
