@@ -273,8 +273,8 @@ SOLAR_VOLTAGE_PIN =  3   ADC
 BATTERY_24V_PIN   =  4   ADC
 DONGLE_BUTTON_PIN =  5   OUTPUT — transistor drives USB dongle power button
 STATUS_LED_PIN    = 13   OUTPUT
-BATTERY_SDA       =  6   I2C SDA — MAX17048
-BATTERY_SCL       =  7   I2C SCL — MAX17048
+BATTERY_SDA       =  6   free — was MAX17048, removed
+BATTERY_SCL       =  7   free — was MAX17048, removed
 ```
 
 ### Key Differences from Main Firmware
@@ -289,10 +289,14 @@ BATTERY_SCL       =  7   I2C SCL — MAX17048
 | Publish interval | Configurable via MQTT | 30 min (TEST_MODE=false) / 1 min (TEST_MODE=true) |
 | Dongle cycle | — | Configurable via Supabase `dongle_cycle_interval_min` |
 | Wall-clock time | NTP not implemented | SNTP via `configTime(UTC+2)` — synced on every WiFi connect; 10 s bounded wait; accessor `getLocalTimeNow()` |
+| Power system | 24V lead-acid + 18650 (MAX17048 I2C gauge) | 12V LiFePO4 4S — direct ADC only; no I2C gauge |
+| ADC method | Raw ADC × divider ratio | `analogReadMilliVolts()` × scale; `[CAL]` boot print for verification (`true_scale = V_multimeter / (pin_mV / 1000)`) |
 
 ### Payload Fields
 
-`flow_1`, `valve_1`, `battery_pct`, `battery_v`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s`
+`flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s`
+
+> `battery_24v_v` / `battery_24v_pct` reflect the **12V LFP pack** (name kept for DB column compatibility). `battery_pct` and `battery_v` (18650 gauge) are not sent — they were removed when MAX17048 was removed.
 
 ### `board_config.h` (per-unit file, edit before flash)
 
@@ -323,6 +327,7 @@ BATTERY_SCL       =  7   I2C SCL — MAX17048
 | EMQX Serverless TLS CA mismatch | Fixed — EMQX Serverless uses its own CA; `setCACert(DigiCert)` fails. Fix: `secureClient.setInsecure()` (still TLS-encrypted) |
 | VALVE_1_OPEN on GPIO11 (faulty) | Fixed — GPIO11 confirmed faulty on test board. Reassigned to GPIO8. |
 | SuperMini had no wall-clock time | Fixed — SNTP added via `configTime(UTC+2, 0, "pool.ntp.org", "time.google.com")`. Syncs on every WiFi connect. Bounded 10 s wait; `getLocalTimeNow()` accessor for schedule code. Botswana = UTC+2, no DST. |
+| SuperMini power constants copied from 24V lead-acid main board | Fixed — MAX17048 removed (cannot read a 12V pack); constants corrected for 12V LFP 4S + 3× parallel 36-cell panels (Voc ~22V); `analogReadMilliVolts()` replaces raw ADC; LFP piecewise SoC curve; `[CAL]` boot print for scale calibration. **ADC scales still need multimeter verification.** |
 
 ---
 

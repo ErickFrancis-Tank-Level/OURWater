@@ -19,7 +19,7 @@ ESP32-S3 firmware for remote water metering nodes. Reads flow sensors, controls 
 
 - [Arduino CLI](https://arduino.github.io/arduino-cli/) installed at `C:\Users\erick\arduino-cli\arduino-cli.exe`
 - `esp32:esp32` core installed: `arduino-cli core install esp32:esp32`
-- Required libraries: `PubSubClient`, `ArduinoJson`, `MAX1704X`
+- Required libraries: `PubSubClient`, `ArduinoJson` (`MAX1704X` is only needed by the main board firmware — not SuperMini)
 
 ### 1. Configure the board
 
@@ -119,6 +119,9 @@ OURWater_SuperMini/           Standalone WiFi-only node (no LTE modem) — sourc
 | Timestamps | Board sets Botswana local time (UTC+2, no DST); bot.py uses its own `datetime.now(UTC)` for DB rows |
 | Publish interval | 30 min (`TEST_MODE=false`) / 1 min (`TEST_MODE=true`) |
 | Dongle cycle | Configurable — `dongle_cycle_interval_min` in Supabase `meters` table |
+| Battery | 12V LiFePO4 4S — no I2C gauge; direct ADC via `BATTERY_24V_PIN` |
+| ADC calibration | `BATT_ADC_SCALE` / `SOLAR_ADC_SCALE` default `11.0f` — verify with multimeter: `true_scale = V_multimeter / (pin_mV / 1000)`. `[CAL]` print at boot shows raw mV and reported V. |
+| Payload fields | `flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s` (no `battery_pct` / `battery_v`) |
 
 ---
 
