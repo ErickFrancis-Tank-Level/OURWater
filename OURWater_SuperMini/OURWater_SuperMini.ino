@@ -28,7 +28,8 @@
 #define SOLAR_VOLTAGE_PIN   3
 #define BATTERY_24V_PIN     4
 #define DONGLE_BUTTON_PIN   5
-#define STATUS_LED_PIN     13
+#define NEO_PIN            48   // onboard WS2812B RGB LED
+#define STATUS_LED_PIN     13   // simple blue LED — kept as secondary indicator
 #define BATTERY_SDA         6   // free — was MAX17048, removed
 #define BATTERY_SCL         7   // free — was MAX17048, removed
 
@@ -44,6 +45,35 @@
 
 // 3× 36-cell panels in parallel — Voc ~22V
 #define SOLAR_MAX_V    22.0f
+
+// ─── RGB status LED (WS2812B GPIO48) — enum must be before Arduino hoists prototypes ──
+enum LedMode : uint8_t { LED_DISCONNECTED, LED_CONNECTED, LED_DONGLING };
+
+void setLedMode(LedMode m);   // forward declaration — body below state block
+
+void serviceLED() {
+    uint32_t now = millis();
+    if (TEST_MODE) {
+        neopixelWrite(NEO_PIN, 0, 30, 0);   // solid green — test mode
+        return;
+    }
+    extern LedMode  ledMode;
+    extern uint32_t ledToggleMs;
+    extern bool     ledOn;
+    uint32_t period;
+    uint8_t  r = 0, g = 0, b = 0;
+    switch (ledMode) {
+        case LED_CONNECTED:    period = 1000; b = 30;         break;   // 1s blue blink
+        case LED_DONGLING:     period = 3000; r = 25; g = 10; break;   // 3s orange blink
+        case LED_DISCONNECTED: period =  250; r = 30;         break;   // fast red blink
+        default:               period = 1000;                 break;
+    }
+    if (now - ledToggleMs >= period) {
+        ledToggleMs = now;
+        ledOn = !ledOn;
+        ledOn ? neopixelWrite(NEO_PIN, r, g, b) : neopixelWrite(NEO_PIN, 0, 0, 0);
+    }
+}
 
 // ─── CA certificate (DigiCert Global Root G2 — same as OURWater.ino) ─────────
 const char* CA_CERT =
@@ -95,6 +125,14 @@ uint32_t lastDongleCycleMs = 0;
 
 bool timeSynced        = false;
 bool skipNextValveCmd  = false;   // true after each subscribe; blocks the retained cmd replay
+
+LedMode  ledMode         = LED_DISCONNECTED;
+uint32_t ledToggleMs     = 0;
+bool     ledOn           = false;
+
+void setLedMode(LedMode m) {
+    if (ledMode != m) { ledMode = m; ledToggleMs = 0; ledOn = false; }
+}
 
 Preferences      prefs;
 WiFiClientSecure secureClient;
@@ -362,6 +400,7 @@ bool mqttReconnect() {
         skipNextValveCmd = true;   // ignore retained cmd replayed by broker on (re)connect
         publishStatus("online");
         digitalWrite(STATUS_LED_PIN, HIGH);
+        setLedMode(LED_CONNECTED);
         // Only publish on first connect or if the full interval has already elapsed.
         // Reconnects mid-interval (e.g. after a dongle cycle) skip the publish so
         // the flow table only gets records on the regular schedule.
@@ -388,6 +427,7 @@ void doDongleCycle() {
         mqttClient.disconnect();
     }
     digitalWrite(STATUS_LED_PIN, LOW);
+    setLedMode(LED_DONGLING);
 
     // Step 1 — press button to power off dongle
     Serial.println("[Dongle] Button press — power OFF");
@@ -454,6 +494,7 @@ void setup() {
     Serial.println("[GPIO] Flow sensor ready (GPIO10, ESP-IDF ISR)");
 
     // Output pins — all LOW on boot
+    neopixelWrite(NEO_PIN, 0, 0, 0);   // clear WS2812B before it latches noise
     pinMode(VALVE_1_OPEN,      OUTPUT); digitalWrite(VALVE_1_OPEN,      LOW);
     pinMode(VALVE_1_CLOSE,     OUTPUT); digitalWrite(VALVE_1_CLOSE,     LOW);
     pinMode(DONGLE_BUTTON_PIN, OUTPUT); digitalWrite(DONGLE_BUTTON_PIN, LOW);
@@ -504,10 +545,12 @@ void setup() {
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
     serviceValve();   // first — de-energises relay on travel timeout even while MQTT is down
+    serviceLED();     // non-blocking RGB status update
 
     // Reconnect if disconnected
     if (!mqttClient.connected()) {
         digitalWrite(STATUS_LED_PIN, LOW);
+        setLedMode(LED_DISCONNECTED);
         delay(5000);
         mqttReconnect();
         return;
