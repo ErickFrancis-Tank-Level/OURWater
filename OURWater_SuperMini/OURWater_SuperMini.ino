@@ -128,8 +128,11 @@ uint32_t   valve1MoveStartMs = 0;
 uint32_t dongleCycleIntervalMin = 60;
 uint32_t dongleOffDurationMin   = 5;
 
-uint32_t lastPublishMs     = 0;
-uint32_t lastDongleCycleMs = 0;
+uint32_t lastPublishMs        = 0;
+uint32_t lastDongleCycleMs    = 0;
+uint32_t lastConnectAttemptMs = 0;
+uint32_t connectBackoffMs     = 5000;
+static const uint32_t CONNECT_BACKOFF_MAX = 120000;
 
 bool timeSynced        = false;
 bool skipNextValveCmd  = false;   // true after each subscribe; blocks the retained cmd replay
@@ -563,12 +566,6 @@ void setup() {
     mqttClient.setBufferSize(512);
     mqttClient.setKeepAlive(60);
 
-    // Connect WiFi, fetch fresh settings from Supabase, connect MQTT
-    if (connectWiFi()) {
-        fetchDongleSettings();
-    }
-    mqttReconnect();
-
     // Arm dongle cycle timer from now so first cycle fires after full interval
     lastDongleCycleMs = millis();
 
@@ -580,12 +577,21 @@ void loop() {
     serviceValve();   // first — de-energises relay on travel timeout even while MQTT is down
     serviceLED();     // non-blocking RGB status update
 
-    // Reconnect if disconnected
+    // Connection manager — non-blocking backoff between attempts.
+    // serviceValve/serviceLED above run every iteration regardless of connection state.
     if (!mqttClient.connected()) {
         digitalWrite(STATUS_LED_PIN, LOW);
         setLedMode(LED_DISCONNECTED);
-        delay(5000);
-        mqttReconnect();
+        if (millis() - lastConnectAttemptMs >= connectBackoffMs) {
+            lastConnectAttemptMs = millis();
+            if (mqttReconnect()) {
+                connectBackoffMs = 5000;
+            } else {
+                connectBackoffMs *= 2;
+                if (connectBackoffMs > CONNECT_BACKOFF_MAX) connectBackoffMs = CONNECT_BACKOFF_MAX;
+                Serial.printf("[Net] Next retry in %lu s\n", connectBackoffMs / 1000);
+            }
+        }
         return;
     }
 
