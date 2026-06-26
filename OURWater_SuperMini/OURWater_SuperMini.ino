@@ -123,8 +123,11 @@ void IRAM_ATTR onFlow1(void* arg) {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 enum ValveState : uint8_t { VALVE_STOPPED, VALVE_OPENING, VALVE_CLOSING, VALVE_OPEN, VALVE_CLOSED };
-ValveState valve1State     = VALVE_STOPPED;
+ValveState valve1State       = VALVE_STOPPED;
 uint32_t   valve1MoveStartMs = 0;
+
+esp_timer_handle_t valveStopTimer      = nullptr;
+volatile bool      valveStoppedByTimer = false;
 
 uint32_t dongleCycleIntervalMin = 60;
 uint32_t dongleOffDurationMin   = 5;
@@ -203,6 +206,13 @@ int solarVoltageToPercent(float v) {
     return (int)constrain((v / SOLAR_MAX_V) * 100.0f, 0.0f, 100.0f);
 }
 
+// ─── Valve hw-timer callback — drops relays independent of loop() ────────────
+void IRAM_ATTR valveStopCallback(void* arg) {
+    gpio_set_level((gpio_num_t)VALVE_1_OPEN,  0);
+    gpio_set_level((gpio_num_t)VALVE_1_CLOSE, 0);
+    valveStoppedByTimer = true;
+}
+
 // ─── Valve control (same safety logic as OURWater.ino) ───────────────────────
 const char* valveStateStr() {
     switch (valve1State) {
@@ -219,15 +229,22 @@ void safeSetValve(const String& action) {
         digitalWrite(VALVE_1_CLOSE, LOW);
         delay(200);
         digitalWrite(VALVE_1_OPEN, HIGH);
-        valve1State      = VALVE_OPENING;
+        valve1State       = VALVE_OPENING;
         valve1MoveStartMs = millis();
+        esp_timer_stop(valveStopTimer);
+        valveStoppedByTimer = false;
+        esp_timer_start_once(valveStopTimer, (uint64_t)VALVE_TRAVEL_MS * 1000ULL);
     } else if (action == "close") {
         digitalWrite(VALVE_1_OPEN, LOW);
         delay(200);
         digitalWrite(VALVE_1_CLOSE, HIGH);
-        valve1State      = VALVE_CLOSING;
+        valve1State       = VALVE_CLOSING;
         valve1MoveStartMs = millis();
+        esp_timer_stop(valveStopTimer);
+        valveStoppedByTimer = false;
+        esp_timer_start_once(valveStopTimer, (uint64_t)VALVE_TRAVEL_MS * 1000ULL);
     } else if (action == "stop") {
+        esp_timer_stop(valveStopTimer);
         digitalWrite(VALVE_1_OPEN,  LOW);
         digitalWrite(VALVE_1_CLOSE, LOW);
     }
@@ -488,15 +505,21 @@ void doDongleCycle() {
     esp_task_wdt_reset();
 }
 
-// ─── Non-blocking valve travel auto-stop ─────────────────────────────────────
+// ─── Valve service — reconciles state after hw-timer fires, sw-fallback if not ──
 void serviceValve() {
+    if (valveStoppedByTimer) {
+        valveStoppedByTimer = false;
+        if (valve1State == VALVE_OPENING)      valve1State = VALVE_OPEN;
+        else if (valve1State == VALVE_CLOSING) valve1State = VALVE_CLOSED;
+        Serial.printf("[Valve] travel complete (hw-timer) -> %s\n", valveStateStr());
+        return;
+    }
     if (valve1State != VALVE_OPENING && valve1State != VALVE_CLOSING) return;
     if (millis() - valve1MoveStartMs < VALVE_TRAVEL_MS) return;
     bool wasOpening = (valve1State == VALVE_OPENING);
     safeSetValve("stop");
     valve1State = wasOpening ? VALVE_OPEN : VALVE_CLOSED;
-    Serial.printf("[Valve] travel complete -> %s (relay off)\n",
-                  wasOpening ? "open" : "closed");
+    Serial.printf("[Valve] travel complete (sw-fallback) -> %s\n", valveStateStr());
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -538,6 +561,18 @@ void setup() {
     pinMode(DONGLE_BUTTON_PIN, OUTPUT); digitalWrite(DONGLE_BUTTON_PIN, LOW);
     pinMode(STATUS_LED_PIN,    OUTPUT); digitalWrite(STATUS_LED_PIN,    LOW);
     Serial.println("[GPIO] Outputs ready");
+
+    // One-shot hw-timer: drops valve relays at travel deadline even while loop() is blocked.
+    {
+        const esp_timer_create_args_t valveTimerArgs = {
+            .callback        = &valveStopCallback,
+            .arg             = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name            = "valve_stop",
+        };
+        esp_timer_create(&valveTimerArgs, &valveStopTimer);
+        Serial.println("[Valve] hw-timer created");
+    }
 
     // ADC calibration — set BATT_ADC_SCALE / SOLAR_ADC_SCALE to match real divider.
     // Procedure: measure true voltage with a multimeter, read pin_mV from serial,
