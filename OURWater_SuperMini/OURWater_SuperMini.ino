@@ -138,8 +138,7 @@ uint32_t lastConnectAttemptMs = 0;
 uint32_t connectBackoffMs     = 5000;
 static const uint32_t CONNECT_BACKOFF_MAX = 120000;
 
-bool timeSynced        = false;
-bool skipNextValveCmd  = false;   // true after each subscribe; blocks the retained cmd replay
+bool timeSynced = false;
 
 LedMode  ledMode         = LED_DISCONNECTED;
 uint32_t ledToggleMs     = 0;
@@ -226,6 +225,10 @@ const char* valveStateStr() {
 
 void safeSetValve(const String& action) {
     if (action == "open") {
+        if (valve1State == VALVE_OPEN || valve1State == VALVE_OPENING) {
+            Serial.println("[Valve] open ignored — already open/opening");
+            return;
+        }
         digitalWrite(VALVE_1_CLOSE, LOW);
         delay(200);
         digitalWrite(VALVE_1_OPEN, HIGH);
@@ -235,6 +238,10 @@ void safeSetValve(const String& action) {
         valveStoppedByTimer = false;
         esp_timer_start_once(valveStopTimer, (uint64_t)VALVE_TRAVEL_MS * 1000ULL);
     } else if (action == "close") {
+        if (valve1State == VALVE_CLOSED || valve1State == VALVE_CLOSING) {
+            Serial.println("[Valve] close ignored — already closed/closing");
+            return;
+        }
         digitalWrite(VALVE_1_OPEN, LOW);
         delay(200);
         digitalWrite(VALVE_1_CLOSE, HIGH);
@@ -301,11 +308,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] Rcv: %s | %s\n", topic, msg);
 
     if (t.endsWith("/valve/1/cmd")) {
-        if (skipNextValveCmd) {
-            skipNextValveCmd = false;
-            Serial.printf("[Valve] Ignoring retained cmd on reconnect: %s\n", msg);
-            return;
-        }
+        // On boot, valve1State=STOPPED so the retained cmd is acted on once — re-asserts intended state after reboot.
         safeSetValve(p);
     } else if (t.endsWith("/config/dongle_cycle")) {
         int val = p.toInt();
@@ -426,7 +429,6 @@ bool mqttReconnect() {
     if (ok) {
         Serial.println(" OK");
         mqttClient.subscribe(BASE_TOPIC "/#");
-        skipNextValveCmd = true;   // ignore retained cmd replayed by broker on (re)connect
         publishStatus("online");
         digitalWrite(STATUS_LED_PIN, HIGH);
         setLedMode(LED_CONNECTED);
@@ -494,7 +496,6 @@ void doDongleCycle() {
         } else {
             Serial.println("[Dongle] MQTT reconnected OK");
             mqttClient.subscribe(BASE_TOPIC "/#");
-            skipNextValveCmd = true;
             publishStatus("online");
             setLedMode(LED_CONNECTED);
         }
