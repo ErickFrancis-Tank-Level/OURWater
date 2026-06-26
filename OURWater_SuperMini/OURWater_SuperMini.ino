@@ -52,8 +52,9 @@
 #define BATT_CRITICAL_V      12.2f   //  8% — dongle off, status only
 #define BATT_VALVE_RESERVE_V 11.8f   //  3% — dongle off, valve only, 1×/day
 
-// ─── RGB status LED (WS2812B GPIO48) — enum must be before Arduino hoists prototypes ──
-enum LedMode : uint8_t { LED_DISCONNECTED, LED_CONNECTED, LED_DONGLING };
+// ─── Enums — must be before Arduino hoists prototypes ────────────────────────
+enum LedMode   : uint8_t { LED_DISCONNECTED, LED_CONNECTED, LED_DONGLING };
+enum PowerTier : uint8_t { TIER_NORMAL, TIER_CONSERVE, TIER_CRITICAL, TIER_VALVE_RESERVE };
 
 void setLedMode(LedMode m);   // forward declaration — body below state block
 
@@ -140,6 +141,11 @@ static const uint32_t CONNECT_BACKOFF_MAX = 120000;
 
 bool timeSynced = false;
 
+PowerTier powerTier      = TIER_NORMAL;
+float     lastBattV      = 0.0f;
+
+uint32_t lastTierCheckMs = 0;
+
 LedMode  ledMode         = LED_DISCONNECTED;
 uint32_t ledToggleMs     = 0;
 bool     ledOn           = false;
@@ -147,6 +153,16 @@ bool     ledOn           = false;
 void setLedMode(LedMode m) {
     if (ledMode != m) { ledMode = m; ledToggleMs = 0; ledOn = false; }
 }
+
+const char* tierName(PowerTier t) {
+    switch (t) {
+        case TIER_CONSERVE:      return "conserve";
+        case TIER_CRITICAL:      return "critical";
+        case TIER_VALVE_RESERVE: return "valve_reserve";
+        default:                 return "normal";
+    }
+}
+const char* powerTierStr() { return tierName(powerTier); }
 
 Preferences      prefs;
 WiFiClientSecure secureClient;
@@ -205,6 +221,48 @@ int solarVoltageToPercent(float v) {
     return (int)constrain((v / SOLAR_MAX_V) * 100.0f, 0.0f, 100.0f);
 }
 
+// ─── Power tier evaluation ────────────────────────────────────────────────────
+void updatePowerTier() {
+    float v = readBattery24V();   // returns 0.0 if below 6V floor (invalid / disconnected)
+    lastBattV = v;
+
+    // INVALID / disconnected reading — never shed.
+    if (v < 6.0f) {
+        if (powerTier != TIER_NORMAL) {
+            Serial.println("[Power] battery reading invalid (<6V) — forcing NORMAL, no shedding");
+            powerTier = TIER_NORMAL;
+        }
+        return;
+    }
+
+    PowerTier prev   = powerTier;
+    PowerTier target;
+    const float HYST = 0.2f;
+
+    // Raw target from thresholds (worsening applies immediately, no hysteresis).
+    if      (v < BATT_VALVE_RESERVE_V) target = TIER_VALVE_RESERVE;
+    else if (v < BATT_CRITICAL_V)      target = TIER_CRITICAL;
+    else if (v < BATT_CONSERVE_V)      target = TIER_CONSERVE;
+    else                               target = TIER_NORMAL;
+
+    // Hysteresis on RECOVERY only: block move to a lighter tier unless voltage
+    // clears that tier's entry threshold by HYST (~0.2V margin required).
+    if (target < powerTier) {
+        float recov;
+        switch (target) {
+            case TIER_NORMAL:   recov = BATT_CONSERVE_V      + HYST; break;
+            case TIER_CONSERVE: recov = BATT_CRITICAL_V      + HYST; break;
+            default:            recov = BATT_VALVE_RESERVE_V + HYST; break;
+        }
+        if (v < recov) target = powerTier;   // not enough margin yet — stay put
+    }
+
+    powerTier = target;
+    if (powerTier != prev) {
+        Serial.printf("[Power] tier %s -> %s (%.2fV)\n", tierName(prev), powerTierStr(), v);
+    }
+}
+
 // ─── Valve hw-timer callback — drops relays independent of loop() ────────────
 void IRAM_ATTR valveStopCallback(void* arg) {
     gpio_set_level((gpio_num_t)VALVE_1_OPEN,  0);
@@ -223,6 +281,7 @@ const char* valveStateStr() {
     }
 }
 
+// Valve is the priority load — never gated by power tier.
 void safeSetValve(const String& action) {
     if (action == "open") {
         if (valve1State == VALVE_OPEN || valve1State == VALVE_OPENING) {
@@ -275,17 +334,19 @@ void publishData() {
     float solarV  = readSolarVoltage();
     float batt24V = readBattery24V();
 
-    char payload[320];
+    char payload[384];
     snprintf(payload, sizeof(payload),
         "{\"flow_1\":%lu,"
         "\"valve_1\":\"%s\","
         "\"solar_v\":%.2f,\"solar_pct\":%d,"
         "\"battery_24v_v\":%.2f,\"battery_24v_pct\":%d,"
+        "\"power_state\":\"%s\","
         "\"firmware\":\"%s\",\"uptime_s\":%lu}",
         (unsigned long)pulses,
         valveStateStr(),
         solarV,  solarVoltageToPercent(solarV),
         batt24V, batteryLFPPercent(batt24V),
+        powerTierStr(),
         FIRMWARE_VER,
         (unsigned long)(millis() / 1000)
     );
@@ -410,6 +471,17 @@ bool connectWiFi() {
     return false;
 }
 
+// ─── Effective publish interval based on power tier ───────────────────────────
+uint32_t effectivePublishIntervalMs() {
+    if (TEST_MODE) return 60000UL;                //  bench: 1 min regardless of tier
+    switch (powerTier) {
+        case TIER_CONSERVE:      return  60UL * 60000UL;    //  1 h
+        case TIER_CRITICAL:      return   8UL * 3600000UL;  //  8 h
+        case TIER_VALVE_RESERVE: return  24UL * 3600000UL;  // 24 h
+        default:                 return  30UL * 60000UL;    // 30 min
+    }
+}
+
 // ─── MQTT connect (includes LWT registration) ────────────────────────────────
 bool mqttReconnect() {
     if (WiFi.status() != WL_CONNECTED) {
@@ -435,8 +507,7 @@ bool mqttReconnect() {
         // Only publish on first connect or if the full interval has already elapsed.
         // Reconnects mid-interval (e.g. after a dongle cycle) skip the publish so
         // the flow table only gets records on the regular schedule.
-        uint32_t intervalMs = TEST_MODE ? 60000UL : 30UL * 60000UL;
-        if (lastPublishMs == 0 || millis() - lastPublishMs >= intervalMs) {
+        if (lastPublishMs == 0 || millis() - lastPublishMs >= effectivePublishIntervalMs()) {
             publishData();
             lastPublishMs = millis();
         }
@@ -657,20 +728,26 @@ void loop() {
 
     mqttClient.loop();   // process incoming messages and keep-alive
 
-    // Periodic data publish
-    uint32_t publishIntervalMs = TEST_MODE ? 60000UL : 30UL * 60000UL;
-    if (millis() - lastPublishMs >= publishIntervalMs) {
+    // Power tier check — every 60 s (ADC reads have settling delays; not every iteration)
+    if (millis() - lastTierCheckMs >= 60000UL) {
+        lastTierCheckMs = millis();
+        updatePowerTier();
+    }
+
+    // Periodic data publish — interval driven by power tier
+    if (millis() - lastPublishMs >= effectivePublishIntervalMs()) {
         publishData();
         lastPublishMs = millis();
     }
 
-    // Dongle power cycle
+    // Dongle power cycle — suppressed in critical/valve_reserve to save power
     uint32_t cycleIntervalMs = TEST_MODE
         ? 5UL * 60000UL
         : dongleCycleIntervalMin * 60000UL;
-    if (dongleCycleIntervalMin > 0 && millis() - lastDongleCycleMs >= cycleIntervalMs) {
+    bool dongleCycleAllowed = (powerTier != TIER_CRITICAL && powerTier != TIER_VALVE_RESERVE);
+    if (dongleCycleAllowed && dongleCycleIntervalMin > 0 && millis() - lastDongleCycleMs >= cycleIntervalMs) {
         doDongleCycle();
-        lastDongleCycleMs = millis();   // reset after cycle completes
+        lastDongleCycleMs = millis();
     }
 
     delay(100);
