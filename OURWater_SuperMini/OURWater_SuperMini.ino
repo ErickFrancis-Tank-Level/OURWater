@@ -22,6 +22,7 @@
 
 #define FIRMWARE_VER    "SM-1.0.0"
 #define VALVE_TRAVEL_MS  15000    // ~15 s end-to-end travel; relay de-energised by serviceValve()
+#define WDT_TIMEOUT_S       30    // generous interim — tightened after dongle cycle is non-blocking
 
 // ─── Pin assignments ──────────────────────────────────────────────────────────
 #define FLOW_1_PIN         10
@@ -397,7 +398,6 @@ bool mqttReconnect() {
     }
 
     secureClient.setTimeout(10);   // 10 s hard limit on TLS handshake
-    esp_task_wdt_reset();          // TLS handshake can block > WDT window — reset before entering
     Serial.print("[MQTT] Connecting...");
     bool ok = mqttClient.connect(
         MQTT_CLIENT, MQTT_USER, MQTT_PASS,
@@ -433,6 +433,7 @@ bool mqttReconnect() {
 //   BASE LOW        → transistor OFF → button released
 void doDongleCycle() {
     Serial.println("[Dongle] Starting cycle");
+    esp_task_wdt_delete(NULL);   // detach for the full cycle (~7.5 min) — re-added at exit
 
     if (mqttClient.connected()) {
         publishStatus("dongle_cycling");
@@ -469,7 +470,6 @@ void doDongleCycle() {
     // Step 6 — reconnect MQTT (WiFi already attempted above; skip re-check in mqttReconnect)
     if (wifiOk) {
         secureClient.setTimeout(10);
-        esp_task_wdt_reset();
         if (!mqttClient.connect(
                 MQTT_CLIENT, MQTT_USER, MQTT_PASS,
                 BASE_TOPIC "/status", 1, true, "{\"status\":\"offline\"}")) {
@@ -484,6 +484,8 @@ void doDongleCycle() {
     } else {
         Serial.println("[Dongle] WiFi failed — MQTT will retry in loop");
     }
+    esp_task_wdt_add(NULL);    // re-subscribe loop task before returning to loop()
+    esp_task_wdt_reset();
 }
 
 // ─── Non-blocking valve travel auto-stop ─────────────────────────────────────
@@ -569,11 +571,29 @@ void setup() {
     // Arm dongle cycle timer from now so first cycle fires after full interval
     lastDongleCycleMs = millis();
 
+    // Take ownership of the Task Watchdog (core 3.x / IDF5 config-struct API).
+    // ESP_ERR_INVALID_STATE means the core already initialised the TWDT — reconfigure it.
+    {
+        esp_task_wdt_config_t wdtCfg = {
+            .timeout_ms     = WDT_TIMEOUT_S * 1000,
+            .idle_core_mask = 0,      // do not watch idle tasks, only our subscribed task
+            .trigger_panic  = true,   // panic + reset on timeout
+        };
+        esp_err_t rc = esp_task_wdt_init(&wdtCfg);
+        if (rc == ESP_ERR_INVALID_STATE) {
+            esp_task_wdt_reconfigure(&wdtCfg);
+        }
+        esp_task_wdt_add(NULL);    // subscribe the loop task
+        esp_task_wdt_reset();
+        Serial.printf("[WDT] Task watchdog armed: %d s, loop task subscribed\n", WDT_TIMEOUT_S);
+    }
+
     Serial.println("[Boot] System ready");
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
+    esp_task_wdt_reset();   // feed the watchdog every iteration
     serviceValve();   // first — de-energises relay on travel timeout even while MQTT is down
     serviceLED();     // non-blocking RGB status update
 
@@ -584,7 +604,11 @@ void loop() {
         setLedMode(LED_DISCONNECTED);
         if (millis() - lastConnectAttemptMs >= connectBackoffMs) {
             lastConnectAttemptMs = millis();
-            if (mqttReconnect()) {
+            esp_task_wdt_delete(NULL);        // detach during blocking connect (WiFi + TLS)
+            bool ok = mqttReconnect();
+            esp_task_wdt_add(NULL);           // re-subscribe immediately after, success or fail
+            esp_task_wdt_reset();
+            if (ok) {
                 connectBackoffMs = 5000;
             } else {
                 connectBackoffMs *= 2;
