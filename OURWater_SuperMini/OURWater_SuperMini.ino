@@ -38,8 +38,8 @@
 
 // ─── ADC calibration — 12V LiFePO4 pack + 3× parallel 10W panels ────────────
 // true_scale = V_multimeter / (pin_mV / 1000.0)  — see [CAL] print in setup()
-// Calibrated 2026-06-25: true=13.14V, pin≈2381mV, scale=13.14/2.381=5.52
-#define BATT_ADC_SCALE   5.52f
+// 100k/10k divider, confirmed by multimeter (ratio 11.01 and 11.00 at 12.8V). Single-point; two-point fit pending a second voltage.
+#define BATT_ADC_SCALE  11.0f
 #define SOLAR_ADC_SCALE  11.0f   // not yet calibrated — verify with multimeter
 
 // 3× 36-cell panels in parallel — Voc ~22V
@@ -195,7 +195,7 @@ float readSolarVoltage() {
 float readBattery24V() {
     uint32_t mv = adcAvgMv(BATTERY_24V_PIN);
     float v = (mv / 1000.0f) * BATT_ADC_SCALE;
-    if (v < 6.0f) return 0.0f;
+    if (v < 9.0f) return 0.0f;  // 9V floor: below this = disconnected/floating pin, not a real 12V LiFePO4 (which BMS-cuts ~10V)
     Serial.printf("[ADC] Battery  pin=%lumV  v=%.2fV\n", mv, v);
     return v;
 }
@@ -223,13 +223,13 @@ int solarVoltageToPercent(float v) {
 
 // ─── Power tier evaluation ────────────────────────────────────────────────────
 void updatePowerTier() {
-    float v = readBattery24V();   // returns 0.0 if below 6V floor (invalid / disconnected)
+    float v = readBattery24V();   // returns 0.0 if below 9V floor (invalid / disconnected)
     lastBattV = v;
 
     // INVALID / disconnected reading — never shed.
-    if (v < 6.0f) {
+    if (v < 9.0f) {
         if (powerTier != TIER_NORMAL) {
-            Serial.println("[Power] battery reading invalid (<6V) — forcing NORMAL, no shedding");
+            Serial.println("[Power] battery reading invalid (<9V) — forcing NORMAL, no shedding");
             powerTier = TIER_NORMAL;
         }
         return;
