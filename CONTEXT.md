@@ -286,17 +286,32 @@ BATTERY_SCL       =  7   free — was MAX17048, removed
 | Flow ISR | Arduino `attachInterrupt()` | ESP-IDF `gpio_isr_handler_add()` — Arduino API silently fails on this variant |
 | TLS | `setCACert(CA_CERT)` | `setInsecure()` — EMQX Serverless uses own CA |
 | `total_1` | Published (cumulative) | Not published — only `flow_1` (interval delta) |
-| Publish interval | Configurable via MQTT | 30 min (TEST_MODE=false) / 1 min (TEST_MODE=true) |
-| Dongle cycle | — | Configurable via Supabase `dongle_cycle_interval_min` |
+| Publish interval | Configurable via MQTT | Tier-driven: 30 min (normal) / 60 min (conserve) / 8 h (critical) / 24 h (valve_reserve); TEST_MODE=true → 1 min |
+| Dongle cycle | — | Configurable via Supabase `dongle_cycle_interval_min`; suppressed in `critical` and `valve_reserve` tiers |
 | Wall-clock time | NTP not implemented | SNTP via `configTime(UTC+2)` — synced on every WiFi connect; 10 s bounded wait; accessor `getLocalTimeNow()` |
 | Power system | 24V lead-acid + 18650 (MAX17048 I2C gauge) | 12V LiFePO4 4S — direct ADC only; no I2C gauge |
-| ADC method | Raw ADC × divider ratio | `analogReadMilliVolts()` × scale; `[CAL]` boot print for verification (`true_scale = V_multimeter / (pin_mV / 1000)`) |
+| ADC method | Raw ADC × divider ratio | `analogReadMilliVolts()` × scale; `[CAL]` boot print: discard first read, average 64 samples at 3 ms spacing, print to 1 mV resolution for multimeter cross-reference |
 
 ### Payload Fields
 
-`flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s`
+`flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `power_state`, `interval_min`, `firmware`, `uptime_s`
 
-> `battery_24v_v` / `battery_24v_pct` reflect the **12V LFP pack** (name kept for DB column compatibility). `battery_pct` and `battery_v` (18650 gauge) are not sent — they were removed when MAX17048 was removed.
+> `battery_24v_v` / `battery_24v_pct` reflect the **12V LFP pack** (name kept for DB column compatibility). `battery_pct` and `battery_v` (18650 gauge) are not sent — they were removed when MAX17048 was removed. `power_state` is one of `normal` / `conserve` / `critical` / `valve_reserve` — see power tier table below. `battery_24v_pct` is **quantized to the nearest 5%** in the payload (ADC noise reduction); the raw voltage used for load-shed decisions is unrounded. `interval_min` reflects the current effective publish interval so the dashboard can compute the correct offline threshold.
+
+### Power Tiers (SuperMini 12V LFP)
+
+Checked every 60 s in `loop()`. Valve control is **never** gated by tier.
+
+| Tier | Voltage | Publish interval | Dongle cycle |
+|------|---------|-----------------|--------------|
+| `normal` | ≥ 12.5 V | 30 min | Enabled |
+| `conserve` | 12.2–12.5 V | 60 min | Enabled |
+| `critical` | 11.8–12.2 V | 8 h | Suspended |
+| `valve_reserve` | < 11.8 V | 24 h | Suspended |
+
+Recovery requires +0.2 V above entry threshold (hysteresis). Readings below 9.0 V are treated as disconnected — stays `normal`, no shedding. (A real 12V LFP with BMS cutoff never reads below ~10 V; a floating/unplugged pin reads 0–1 V.)
+
+---
 
 ### `board_config.h` (per-unit file, edit before flash)
 
@@ -329,6 +344,10 @@ BATTERY_SCL       =  7   free — was MAX17048, removed
 | SuperMini had no wall-clock time | Fixed — SNTP added via `configTime(UTC+2, 0, "pool.ntp.org", "time.google.com")`. Syncs on every WiFi connect. Bounded 10 s wait; `getLocalTimeNow()` accessor for schedule code. Botswana = UTC+2, no DST. |
 | SuperMini power constants copied from 24V lead-acid main board | Fixed — MAX17048 removed (cannot read a 12V pack); constants corrected for 12V LFP 4S + 3× parallel 36-cell panels (Voc ~22V); `analogReadMilliVolts()` replaces raw ADC; LFP piecewise SoC curve; `[CAL]` boot print for scale calibration. **ADC scales still need multimeter verification.** |
 | SuperMini TG0WDT_SYS_RST crash loop on boot | Fixed — `mqttClient.connect()` TLS handshake can block longer than the task watchdog window. Fix: `secureClient.setTimeout(10)` + `esp_task_wdt_reset()` before every blocking MQTT/TLS connect call. Also fixed double `connectWiFi()` in `doDongleCycle()`. |
+| SuperMini firmware hardening Steps 1–6 | Fixed — committed `ffd5c16`. Covers: RTC NOINIT pulse counter, non-blocking connect with backoff, TWDT ownership, hw-timer valve auto-stop, idempotent valve commands, 12V LFP load-shedding tiers. |
+| SuperMini `[CAL]` block — 64-sample averaging | Fixed — committed in `12ffb0a`. Discards first read, averages 64 × 3 ms samples per channel, prints to 1 mV. |
+| BATTERY_24V_PIN (GPIO4) reads near-zero | Fixed — root cause was an open/cold solder joint in the 100k/10k voltage divider on the original PCB. New board built with correct 100k/10k divider on GPIO4; multimeter confirmed junction = 1168 mV at 12.86V (ratio 11.01 ≈ correct). `BATT_ADC_SCALE` corrected from legacy `5.52f` (45k/10k era) to `11.0f` in commit `12ffb0a`. Original board's USB also failed due to a bad solder joint — replaced with fresh ESP32-S3 Super Mini. |
+| Battery pct display stability | Fixed — `battery_24v_pct` is now quantized to the nearest 5% at the payload site (`publishData()`). Raw voltage still used unrounded for tier decisions. Committed `046ce29`. |
 
 ---
 
