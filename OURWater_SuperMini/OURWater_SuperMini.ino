@@ -334,6 +334,8 @@ void publishData() {
     float solarV  = readSolarVoltage();
     float batt24V = readBattery24V();
 
+    uint32_t intervalMin = effectivePublishIntervalMs() / 60000UL;
+
     char payload[384];
     snprintf(payload, sizeof(payload),
         "{\"flow_1\":%lu,"
@@ -341,12 +343,14 @@ void publishData() {
         "\"solar_v\":%.2f,\"solar_pct\":%d,"
         "\"battery_24v_v\":%.2f,\"battery_24v_pct\":%d,"
         "\"power_state\":\"%s\","
+        "\"interval_min\":%lu,"
         "\"firmware\":\"%s\",\"uptime_s\":%lu}",
         (unsigned long)pulses,
         valveStateStr(),
         solarV,  solarVoltageToPercent(solarV),
         batt24V, batteryLFPPercent(batt24V),
         powerTierStr(),
+        (unsigned long)intervalMin,
         FIRMWARE_VER,
         (unsigned long)(millis() / 1000)
     );
@@ -646,17 +650,33 @@ void setup() {
         Serial.println("[Valve] hw-timer created");
     }
 
-    // ADC calibration — set BATT_ADC_SCALE / SOLAR_ADC_SCALE to match real divider.
-    // Procedure: measure true voltage with a multimeter, read pin_mV from serial,
-    // then: true_scale = V_multimeter / (pin_mV / 1000.0)
+    // ADC calibration readout — printed on every boot so each voltage point can be recorded.
     {
-        uint32_t battMv  = adcAvgMv(BATTERY_24V_PIN);
-        uint32_t solarMv = adcAvgMv(SOLAR_VOLTAGE_PIN);
-        Serial.printf("[CAL] Battery: pin=%lumV  scale=%.1f  =>  reported=%.2fV\n",
-                      battMv,  BATT_ADC_SCALE,  (battMv  / 1000.0f) * BATT_ADC_SCALE);
-        Serial.printf("[CAL] Solar:   pin=%lumV  scale=%.1f  =>  reported=%.2fV\n",
-                      solarMv, SOLAR_ADC_SCALE, (solarMv / 1000.0f) * SOLAR_ADC_SCALE);
-        Serial.println("[CAL] To calibrate: true_scale = V_multimeter / (pin_mV / 1000)");
+        // Battery calibration point
+        pinMode(BATTERY_24V_PIN, INPUT);
+        gpio_pullup_dis((gpio_num_t)BATTERY_24V_PIN);
+        gpio_pulldown_dis((gpio_num_t)BATTERY_24V_PIN);
+        analogReadMilliVolts(BATTERY_24V_PIN);          // discard first read
+        uint32_t battSum = 0;
+        for (int i = 0; i < 64; i++) { battSum += analogReadMilliVolts(BATTERY_24V_PIN); delay(3); }
+        uint32_t battMv = battSum / 64;
+        Serial.println("[CAL] === BATTERY CALIBRATION POINT ===");
+        Serial.printf( "[CAL] BATTERY_24V_PIN averaged pin = %lu mV  (64 samples)\n", battMv);
+        Serial.printf( "[CAL] current reported voltage = %.2f V\n", (battMv / 1000.0f) * BATT_ADC_SCALE);
+        Serial.println("[CAL] Record multimeter TRUE voltage + the pin mV above. Need TWO points at two different battery voltages.");
+
+        // Solar calibration point
+        pinMode(SOLAR_VOLTAGE_PIN, INPUT);
+        gpio_pullup_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
+        gpio_pulldown_dis((gpio_num_t)SOLAR_VOLTAGE_PIN);
+        analogReadMilliVolts(SOLAR_VOLTAGE_PIN);        // discard first read
+        uint32_t solarSum = 0;
+        for (int i = 0; i < 64; i++) { solarSum += analogReadMilliVolts(SOLAR_VOLTAGE_PIN); delay(3); }
+        uint32_t solarMv = solarSum / 64;
+        Serial.println("[CAL] === SOLAR CALIBRATION POINT ===");
+        Serial.printf( "[CAL] SOLAR_VOLTAGE_PIN averaged pin = %lu mV  (64 samples)\n", solarMv);
+        Serial.printf( "[CAL] current reported voltage = %.2f V\n", (solarMv / 1000.0f) * SOLAR_ADC_SCALE);
+        Serial.println("[CAL] Record multimeter TRUE voltage + the pin mV above. Need TWO points at two different solar voltages.");
     }
 
     // Load persisted dongle settings (fallback if Supabase unreachable)
