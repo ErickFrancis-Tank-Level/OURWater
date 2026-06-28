@@ -336,6 +336,10 @@ void publishData() {
 
     uint32_t intervalMin = effectivePublishIntervalMs() / 60000UL;
 
+    // Quantize displayed SoC to nearest 5% for display stability (ADC noise).
+    // Raw voltage is kept unrounded — tier logic uses batt24V directly, not this value.
+    int battPct = ((batteryLFPPercent(batt24V) + 2) / 5) * 5;
+
     char payload[384];
     snprintf(payload, sizeof(payload),
         "{\"flow_1\":%lu,"
@@ -348,7 +352,7 @@ void publishData() {
         (unsigned long)pulses,
         valveStateStr(),
         solarV,  solarVoltageToPercent(solarV),
-        batt24V, batteryLFPPercent(batt24V),
+        batt24V, battPct,
         powerTierStr(),
         (unsigned long)intervalMin,
         FIRMWARE_VER,
