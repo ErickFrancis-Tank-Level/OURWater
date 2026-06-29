@@ -298,6 +298,26 @@ BATTERY_SCL       =  7   free — was MAX17048, removed
 
 > `battery_24v_v` / `battery_24v_pct` reflect the **12V LFP pack** (name kept for DB column compatibility). `battery_pct` and `battery_v` (18650 gauge) are not sent — they were removed when MAX17048 was removed. `power_state` is one of `normal` / `conserve` / `critical` / `valve_reserve` — see power tier table below. `battery_24v_pct` is **quantized to the nearest 5%** in the payload (ADC noise reduction); the raw voltage used for load-shed decisions is unrounded. `interval_min` reflects the current effective publish interval so the dashboard can compute the correct offline threshold.
 
+**Architecture principle — raw truth on board, interpretation in dashboard.** `battery_24v_v` (raw ADC voltage) is the authoritative signal; the dashboard computes SoC % from it via `battsocFromVoltage()` using a corrected LiFePO4 resting-voltage curve. `battery_24v_pct` is **vestigial for display** — the dashboard no longer uses it. It remains in the payload for DB column continuity and will be removed in the `battery_24v_*` rename cleanup. This principle applies broadly: the board reports raw sensor values; the dashboard does all interpretation. Display logic, curves, and thresholds can be corrected fleet-wide without any reflash.
+
+**LiFePO4 SoC curve used in dashboard (4S pack, piecewise-linear):**
+
+| Voltage (V) | SoC (%) |
+|-------------|---------|
+| 10.0 | 0 |
+| 12.0 | 9 |
+| 12.5 | 20 |
+| 12.8 | 40 |
+| 13.0 | 55 |
+| 13.1 | 70 |
+| 13.2 | 85 |
+| 13.3 | 95 |
+| 13.4 | 100 |
+| 13.8 | 110 |
+| 14.6 | 115 |
+
+`>100%` = charger present / float charge. Invalid, missing, or `< 9 V` input → displayed as "—" (not 0%). Inherently approximate ±15–20% in the 12.5–13.0 V mid-range due to LiFePO4's flat discharge curve; use raw voltage and firmware load-shed thresholds as the authoritative signals.
+
 ### Power Tiers (SuperMini 12V LFP)
 
 Checked every 60 s in `loop()`. Valve control is **never** gated by tier.
@@ -348,6 +368,8 @@ Recovery requires +0.2 V above entry threshold (hysteresis). Readings below 9.0 
 | SuperMini `[CAL]` block — 64-sample averaging | Fixed — committed in `12ffb0a`. Discards first read, averages 64 × 3 ms samples per channel, prints to 1 mV. |
 | BATTERY_24V_PIN (GPIO4) reads near-zero | Fixed — root cause was an open/cold solder joint in the 100k/10k voltage divider on the original PCB. New board built with correct 100k/10k divider on GPIO4; multimeter confirmed junction = 1168 mV at 12.86V (ratio 11.01 ≈ correct). `BATT_ADC_SCALE` corrected from legacy `5.52f` (45k/10k era) to `11.0f` in commit `12ffb0a`. Original board's USB also failed due to a bad solder joint — replaced with fresh ESP32-S3 Super Mini. |
 | Battery pct display stability | Fixed — `battery_24v_pct` is now quantized to the nearest 5% at the payload site (`publishData()`). Raw voltage still used unrounded for tier decisions. Committed `046ce29`. |
+| Battery SoC computation moved to dashboard | Done — `battery_24v_pct` in firmware payload is now vestigial for display. Dashboard computes SoC from raw `battery_24v_v` via `battsocFromVoltage()` (corrected LiFePO4 curve). At 12.79 V shows ~39% (was 25% with firmware curve). No reflash needed to correct future curve changes. |
+| Battery ADC single-point calibration | Open — `BATT_ADC_SCALE=11.0` confirmed by two multimeter readings at ~12.8 V (1144/1167 mV, straddling 11.0 within 2%). A second calibration point at a meaningfully different voltage is needed for a proper two-point fit; deferred until the battery is at a significantly different SoC. |
 
 ---
 
@@ -410,3 +432,112 @@ the rising edge the A7670 PWRKEY auto-start circuit requires.
 - Use a USB power meter to measure current draw when modem is supposed to start
 - Try `modemPowerOn()` with a 2.5s LOW pulse (matches SIM7600 PWRKEY spec exactly) instead of 500ms
 - Test with a fresh flash of the **last known working firmware state** (before `6a4b9ad`) to isolate whether this is a firmware or hardware regression
+
+---
+
+## Layer 2 — Sleep Engine *(DESIGNED, NOT YET IMPLEMENTED)*
+
+> This section is the agreed design spec for the next major firmware version. Nothing below is in the current firmware. Implement section-by-section, starting with `meter_state` + valve three-state, then schedule, then sleep mechanics.
+
+### Command channel — `meter_state` table (one row per meter)
+
+A single Supabase row replaces the current scattered `valve_commands` + schedule tables for board-facing state. The board reads this row on each wake-and-connect; if `desired_version > reported_version`, it applies all changes and writes `reported_version` back.
+
+| Column | Notes |
+|--------|-------|
+| `meter_id` | PK (FK → meters) |
+| `desired_version` | Incremented by dashboard on any change |
+| `reported_version` | Written by board after applying the desired state |
+| `valve_desired` | `open` / `close` — set by dashboard |
+| `valve_reported` | Board's believed physical state — always set on each wake |
+| `valve_confirmed` | True physical position from limit-switch feedback — only set when `feedback_enabled=true` |
+| `feedback_enabled` | Boolean, default `false` — gates limit-switch reads (GPIO6/7); currently `false` because installed valves are defective |
+| `schedule` | JSONB — 15-slot array (see Schedule section) |
+
+**Valve pending indicator (dashboard):** `valve_desired ≠ valve_reported` → badge shows "pending" (greyed). No extra column needed.
+
+**Valve execution:** just drive the relay; no state pre-check. The hardware travel timer arms on every command, whether or not the valve was already in that position. This is intentional — the relay energises briefly and the timer drops it; worst case is a wasted 15 s pulse.
+
+**Valve feedback (when `feedback_enabled=true`):** continuous-contact limit switches on GPIO6 (open-sense) and GPIO7 (close-sense). Read true position on every wake. Alarm on mismatch between `valve_reported` and `valve_confirmed`.
+
+### Schedule — 15 fixed slots
+
+Stored locally on the board in NVS and synced from `meter_state.schedule` on connect. The schedule runs fully offline once synced.
+
+```json
+[
+  { "active": true, "time": "06:00", "days": [1,2,3,4,5,6,7], "action": "open" },
+  { "active": true, "time": "18:00", "days": [1,2,3,4,5,6,7], "action": "close" },
+  ...
+]
+```
+
+- 15 fixed slots. Blank / `active=false` slots are ignored.
+- Times are UTC+2 wall-clock. 7-day bitmask (`days` array, 1=Mon … 7=Sun).
+- **Watermark / latch:** on each wake, for today's day-of-week, fire any slot whose `time` has already passed and has not yet been actioned today (catches up if the board was asleep at the exact minute). One-shot per slot per calendar day.
+- Valve holds its last commanded state between events (open stays open until a close slot fires).
+- Dashboard editor enforces the 15-slot cap and shows a "pending sync" badge while `desired_version > reported_version`.
+
+### Wake cadence
+
+Hardcoded fleet-wide in firmware — not per-site:
+
+| Period | Cadence |
+|--------|---------|
+| Day (06:00–18:00 local) | Every 30 min |
+| Night (18:00–06:00 local) | Every 60 min |
+
+Per-site valve schedule is in `meter_state`. Per-site dongle timing is already in Supabase `meters` and synced on connect.
+
+### Manual override
+
+A manual open or close from the dashboard skips the **next single** scheduled event (whatever it is — open or close). After that skip, the schedule fully resumes. To hold the valve in a non-schedule state longer, disable the relevant slot(s) in the schedule editor.
+
+### Battery rules (raw voltage, two thresholds, no deadband)
+
+| Voltage | Behaviour |
+|---------|-----------|
+| ≥ 12.0 V | Normal — wake, connect dongle, sync `meter_state`, follow schedule |
+| 11.5–12.0 V | **Dark mode** — dongle OFF (no connect, no sync), but valve schedule still runs locally from NVS |
+| < 11.5 V | **Fail-safe** — dongle off; FORCE valve OPEN and hold; all schedules and manual commands ignored until recovery. Fail-safe event logged locally, uploaded on first reconnect. `valve_desired` in meter_state is NOT overwritten — the physical valve is forced open but desired state is preserved. |
+
+Recovery: valve schedules resume at ≥ 11.5 V (dark mode ends); dongle/connect resumes at ≥ 12.0 V. Recovery thresholds match entry thresholds — no deadband (simpler for a fail-safe path; real hysteresis lives in the power tier table above).
+
+> **Rationale for "force open" at < 11.5 V:** If the battery dies on-site, the valve must default to a state that prevents harm. Open = water flows = no burst-pipe damage from pressure build-up. The physical override on-site is the manual valve handle.
+
+### Stay-awake mode
+
+A one-shot, operator-triggered mode that overrides the wake cadence temporarily:
+
+- Activated via dashboard or Telegram
+- Board switches to 1-minute publish cadence
+- RTC-tracked: persists across dongle cycles and soft resets; does NOT survive a power-off (returns to normal cadence on cold boot)
+- 3-hour hard cap, then automatic return to last-good cadence
+- Replaces the compile-time `TEST_MODE` flag (which required a reflash)
+- "Return to last-good" = resume the normal day/night cadence from the current time
+
+### Not yet designed — sleep mechanics
+
+The following will be specified in a future session:
+- Light-sleep implementation (ESP32 `esp_light_sleep_start()` vs modem-off deep sleep)
+- Pulse counting through sleep (RTC NOINIT counter already in place — just needs the sleep entry/exit wiring)
+- Dongle down-sequence (timing, WiFi disconnect, GPIO5 pulse)
+- Exact wake sequence (dongle boot wait, WiFi reconnect, NTP re-sync, meter_state read, schedule catch-up, publish, sleep)
+- NVS layout for local schedule + watermarks
+
+---
+
+## Parked Items / Open Threads
+
+Issues that are acknowledged, understood, and deferred — not forgotten.
+
+| Item | Detail |
+|------|--------|
+| **Valve feedback wiring** | Current motorised valves are defective (no reliable limit-switch signal). Design is ready and gated behind `feedback_enabled=false` in `meter_state`. Revisit when working valves are on-site. GPIO6 (open-sense) and GPIO7 (close-sense) are reserved. |
+| **`battery_24v_*` field rename** | Legacy naming carries a 12V reading in a `battery_24v_*` column. Rename `battery_24v_v→battery_v`, `battery_24v_pct→battery_pct` across firmware payload + DB column + dashboard as one coordinated change — not piecemeal, to avoid a mismatch window. Schedule after Layer 2 is stable. |
+| **Per-board ADC scale** | Voltage-divider ratio varies ~2% board-to-board (old board 11.01, current 11.0). Long-term: store `batt_adc_scale` per board in Supabase `meters`, read on boot; or use 1% tolerance resistors. Avoids per-board recompile. |
+| **Offline-alarm Markdown** | The offline Telegram message uses `parse_mode=Markdown` with `*OW-SM-001*` (hyphens in bold). Hyphens in Markdown v1 are fine, but this combination is untested against a real offline event. If a real offline alert ever fails to arrive, switch that message to plain text. The chat ID and connection are confirmed working (test message received). |
+| **ADC validity-ceiling** | The current 9 V floor catches a grounded/shorted GPIO4 but a floating (disconnected) pin can read ~20 V on ESP32-S3 (internal pull creates phantom voltage through the divider). Consider rejecting readings > 15 V as physically impossible for a 12V pack. |
+| **`VALVE_1_OPEN` pin in docs** | Multiple docs have disagreed between GPIO8 and GPIO11. Current firmware has GPIO11 (fixed in commit). Confirm against physical wiring on the deployed board and ensure schematic, code, and all docs agree. |
+| **`/#` MQTT subscription** | Board subscribes to `BASE_TOPIC/#`, which means it receives its own published `data` and `status` messages (self-echo). Harmless but wastes cellular data. Switch to explicit subtopic subscriptions (`/valve/1/cmd`, `/config/*`) when optimising data usage. |
+| **`TEST_MODE` bench setting** | OW-SM-001 may have `TEST_MODE=true` set locally for bench testing. `board_config.h` is not committed (field default `false` is already committed). Set false before field deployment; confirm with `[Config]` line in boot serial output. |
