@@ -112,13 +112,14 @@ OURWater_SuperMini/           Standalone WiFi-only node (no LTE modem) — sourc
 |----------|-------|
 | Board | ESP32-S3 Super Mini |
 | Connectivity | WiFi via USB 4G dongle hotspot |
-| VALVE_1_OPEN | GPIO **8** (GPIO11 was faulty on test board) |
+| VALVE_1_OPEN | GPIO **11** |
 | VALVE_1_CLOSE | GPIO 12 |
 | FLOW_1 | GPIO 10 — ESP-IDF ISR (Arduino `attachInterrupt` silently fails on this variant) |
 | Time sync | SNTP on every WiFi connect — `configTime(UTC+2)`, 10 s bounded wait |
 | Timestamps | Board sets Botswana local time (UTC+2, no DST); bot.py uses its own `datetime.now(UTC)` for DB rows |
-| Publish interval | 30 min (`TEST_MODE=false`) / 1 min (`TEST_MODE=true`) |
-| Dongle cycle | Configurable — `dongle_cycle_interval_min` in Supabase `meters` table |
+| Publish interval | 30 min normal / 1 min `TEST_MODE=true` — only publishes in `TIER_NORMAL` |
+| Dongle cycle | Configurable — `dongle_cycle_interval_min` in Supabase `meters`; only runs in `TIER_NORMAL` |
+| Battery tiers | `normal` ≥12.0V / `dark` 11.5–12.0V (offline, schedule local) / `fail_open` <11.5V (valve forced open, close refused) |
 | Battery | 12V LiFePO4 4S — no I2C gauge; direct ADC via `BATTERY_24V_PIN` |
 | ADC calibration | `BATT_ADC_SCALE` / `SOLAR_ADC_SCALE` default `11.0f` — verify with multimeter: `true_scale = V_multimeter / (pin_mV / 1000)`. `[CAL]` print at boot shows raw mV and reported V. |
 | Payload fields | `flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `firmware`, `uptime_s` (no `battery_pct` / `battery_v`) |
