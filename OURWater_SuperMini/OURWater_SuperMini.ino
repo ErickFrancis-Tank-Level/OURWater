@@ -157,6 +157,10 @@ bool     ledOn           = false;
 
 bool devMode = false;   // set once at boot from GPIO47+GPIO38 strap; never re-read
 
+int32_t appliedDesiredVersion = -1;   // -1 = no /desired received yet
+String  appliedValveDesired   = "";
+String  scheduleJson          = "[]";
+
 void setLedMode(LedMode m) {
     if (ledMode != m) { ledMode = m; ledToggleMs = 0; ledOn = false; }
 }
@@ -343,6 +347,17 @@ void publishStatus(const char* status) {
     Serial.printf("[MQTT] Status → %s\n", status);
 }
 
+void publishReport() {
+    const char* valveRep = (valve1State == VALVE_OPEN)   ? "open"  :
+                           (valve1State == VALVE_CLOSED)  ? "close" : "stopped";
+    char payload[96];
+    snprintf(payload, sizeof(payload),
+        "{\"reported_version\":%ld,\"valve_reported\":\"%s\"}",
+        (long)appliedDesiredVersion, valveRep);
+    mqttClient.publish(BASE_TOPIC "/report", payload);
+    Serial.printf("[MQTT] Report → %s\n", payload);
+}
+
 void publishData() {
     noInterrupts();
     uint32_t pulses = pulseCount;
@@ -386,26 +401,71 @@ void publishData() {
 
 // ─── MQTT incoming message handler ───────────────────────────────────────────
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    char msg[128];
-    if (length >= sizeof(msg)) length = sizeof(msg) - 1;
-    memcpy(msg, payload, length);
-    msg[length] = '\0';
     String t = String(topic);
-    String p = String(msg);
-    Serial.printf("[MQTT] Rcv: %s | %s\n", topic, msg);
+    Serial.printf("[MQTT] Rcv: %s (%u bytes)\n", topic, length);
 
-    if (t.endsWith("/valve/1/cmd")) {
-        // On boot, valve1State=STOPPED so the retained cmd is acted on once — re-asserts intended state after reboot.
-        safeSetValve(p);
+    if (t.endsWith("/desired")) {
+        // Full payload available in PubSubClient's internal buffer (setBufferSize 1536).
+        String p = String((char*)payload, length);
+
+        // Require version field — ignore malformed messages.
+        int verIdx = p.indexOf("\"version\":");
+        if (verIdx < 0) { Serial.println("[MQTT] /desired missing version — ignored"); return; }
+        int32_t incomingVer = (int32_t)p.substring(verIdx + 10).toInt();
+        if (incomingVer <= appliedDesiredVersion) {
+            Serial.printf("[MQTT] /desired ver %ld <= applied %ld — ignored\n",
+                          (long)incomingVer, (long)appliedDesiredVersion);
+            return;
+        }
+
+        // Extract valve_desired.
+        int vdIdx = p.indexOf("\"valve_desired\":\"");
+        if (vdIdx >= 0) {
+            int start = vdIdx + 17;
+            int end   = p.indexOf('"', start);
+            if (end > start) appliedValveDesired = p.substring(start, end);
+        }
+
+        // Extract schedule JSON array (bracket-depth walk for nested objects).
+        int schIdx = p.indexOf("\"schedule\":");
+        if (schIdx >= 0) {
+            int arrStart = p.indexOf('[', schIdx);
+            if (arrStart >= 0) {
+                int depth = 0, arrEnd = -1;
+                for (int i = arrStart; i < (int)p.length(); i++) {
+                    if      (p[i] == '[') depth++;
+                    else if (p[i] == ']') { if (--depth == 0) { arrEnd = i; break; } }
+                }
+                if (arrEnd > arrStart) {
+                    scheduleJson = p.substring(arrStart, arrEnd + 1);
+                    prefs.putString("schedule", scheduleJson);
+                }
+            }
+        }
+
+        appliedDesiredVersion = incomingVer;
+        prefs.putInt("des_ver", (int)appliedDesiredVersion);
+        if (appliedValveDesired.length() > 0) {
+            prefs.putString("valve_des", appliedValveDesired);
+            safeSetValve(appliedValveDesired);
+        }
+        publishReport();
+        Serial.printf("[MQTT] /desired applied: ver=%ld valve=%s\n",
+                      (long)appliedDesiredVersion, appliedValveDesired.c_str());
+
     } else if (t.endsWith("/config/dongle_cycle")) {
-        int val = p.toInt();
+        char msg[32]; unsigned int len = length < sizeof(msg)-1 ? length : sizeof(msg)-1;
+        memcpy(msg, payload, len); msg[len] = '\0';
+        int val = String(msg).toInt();
         if (val > 0) {
             dongleCycleIntervalMin = (uint32_t)val;
             prefs.putUInt("cycle_min", dongleCycleIntervalMin);
             Serial.printf("[Config] Dongle cycle → %d min\n", val);
         }
     } else if (t.endsWith("/config/dongle_off")) {
-        int val = p.toInt();
+        char msg[32]; unsigned int len = length < sizeof(msg)-1 ? length : sizeof(msg)-1;
+        memcpy(msg, payload, len); msg[len] = '\0';
+        int val = String(msg).toInt();
         if (val > 0) {
             dongleOffDurationMin = (uint32_t)val;
             prefs.putUInt("off_min", dongleOffDurationMin);
@@ -525,6 +585,8 @@ bool mqttReconnect() {
         publishStatus("online");
         digitalWrite(STATUS_LED_PIN, HIGH);
         setLedMode(LED_CONNECTED);
+        publishReport();
+        if (!devMode && powerTier == TIER_FAIL_OPEN) safeSetValve("open");
         // Only publish on first connect or if the full interval has already elapsed.
         // Reconnects mid-interval (e.g. after a dongle cycle) skip the publish so
         // the flow table only gets records on the regular schedule.
@@ -590,6 +652,8 @@ void doDongleCycle() {
             mqttClient.subscribe(BASE_TOPIC "/#");
             publishStatus("online");
             setLedMode(LED_CONNECTED);
+            publishReport();
+            if (!devMode && powerTier == TIER_FAIL_OPEN) safeSetValve("open");
         }
     } else {
         Serial.println("[Dongle] WiFi failed — MQTT will retry in loop");
@@ -875,16 +939,21 @@ void setup() {
     prefs.begin("ourwater_sm", false);
     dongleCycleIntervalMin = prefs.getUInt("cycle_min", 60);
     dongleOffDurationMin   = prefs.getUInt("off_min",   5);
+    appliedDesiredVersion  = (int32_t)prefs.getInt("des_ver", -1);
+    appliedValveDesired    = prefs.getString("valve_des", "");
+    scheduleJson           = prefs.getString("schedule",  "[]");
     Serial.printf("[Config] Dongle cycle=%lu min  off=%lu min  TEST_MODE=%s\n",
                   dongleCycleIntervalMin, dongleOffDurationMin,
                   TEST_MODE ? "ON" : "OFF");
+    Serial.printf("[Config] Desired ver=%ld valve=%s\n",
+                  (long)appliedDesiredVersion, appliedValveDesired.c_str());
 
     // Configure MQTT client
     // EMQX Serverless uses its own CA — skip cert verification (connection is still encrypted).
     secureClient.setInsecure();
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
-    mqttClient.setBufferSize(512);
+    mqttClient.setBufferSize(1536);
     mqttClient.setKeepAlive(60);
 
     // Arm dongle cycle timer from now so first cycle fires after full interval
@@ -892,6 +961,13 @@ void setup() {
 
     // Initial battery band evaluation — sets powerTier before first loop() iteration
     if (!devMode) { updatePowerTier(); lastTierCheckMs = millis(); }
+
+    // Re-assert last desired valve state from NVS (if one was stored and we are not fail-open).
+    // Fail-open already called safeSetValve("open") inside triggerFailOpen(); skip in that case.
+    if (!devMode && powerTier != TIER_FAIL_OPEN && appliedValveDesired.length() > 0) {
+        safeSetValve(appliedValveDesired);
+        Serial.printf("[Boot] Valve reasserted to stored desired: %s\n", appliedValveDesired.c_str());
+    }
 
     // Take ownership of the Task Watchdog (core 3.x / IDF5 config-struct API).
     // ESP_ERR_INVALID_STATE means the core already initialised the TWDT — reconfigure it.
@@ -941,6 +1017,7 @@ void loop() {
             digitalWrite(STATUS_LED_PIN, LOW);
             setLedMode(LED_DISCONNECTED);
         }
+        if (powerTier == TIER_FAIL_OPEN) safeSetValve("open");
         delay(100);
         return;
     }
