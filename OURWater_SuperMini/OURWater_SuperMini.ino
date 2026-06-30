@@ -380,6 +380,7 @@ void publishData() {
         "\"solar_v\":%.2f,\"solar_pct\":%d,"
         "\"battery_24v_v\":%.2f,\"battery_24v_pct\":%d,"
         "\"power_state\":\"%s\","
+        "\"op_mode\":\"%s\","
         "\"interval_min\":%lu,"
         "\"firmware\":\"%s\",\"uptime_s\":%lu}",
         (unsigned long)pulses,
@@ -387,6 +388,7 @@ void publishData() {
         solarV,  solarVoltageToPercent(solarV),
         batt24V, battPct,
         powerTierStr(),
+        devMode ? "dev" : "normal",
         (unsigned long)intervalMin,
         FIRMWARE_VER,
         (unsigned long)(millis() / 1000)
