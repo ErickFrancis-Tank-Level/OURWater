@@ -294,7 +294,7 @@ BATTERY_SCL       =  7   free — was MAX17048, removed
 
 ### Payload Fields
 
-`flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `power_state`, `interval_min`, `firmware`, `uptime_s`
+`flow_1`, `valve_1`, `solar_v`, `solar_pct`, `battery_24v_v`, `battery_24v_pct`, `power_state`, `op_mode`, `interval_min`, `firmware`, `uptime_s`
 
 > `battery_24v_v` / `battery_24v_pct` reflect the **12V LFP pack** (name kept for DB column compatibility). `battery_pct` and `battery_v` (18650 gauge) are not sent — they were removed when MAX17048 was removed. `power_state` is one of `normal` / `dark` / `fail_open` — see power tier table below. `battery_24v_pct` is **quantized to the nearest 5%** in the payload (ADC noise reduction); the raw voltage used for load-shed decisions is unrounded. `interval_min` reflects the current effective publish interval so the dashboard can compute the correct offline threshold.
 
@@ -442,30 +442,57 @@ the rising edge the A7670 PWRKEY auto-start circuit requires.
 
 ---
 
-## Layer 2 — Sleep Engine *(DESIGNED, NOT YET IMPLEMENTED)*
+## BUILT & VERIFIED
 
-> This section is the agreed design spec for the next major firmware version. Nothing below is in the current firmware. Implement section-by-section, starting with `meter_state` + valve three-state, then schedule, then sleep mechanics.
+The following features are implemented, proven end-to-end on the bench, and deployed to production.
 
-### Command channel — `meter_state` table (one row per meter)
+### meter_state command channel
 
-A single Supabase row replaces the current scattered `valve_commands` + schedule tables for board-facing state. The board reads this row on each wake-and-connect; if `desired_version > reported_version`, it applies all changes and writes `reported_version` back.
+dashboard → `meter_state.valve_desired` → DB trigger bumps `desired_version` → bot.py `_run_state_poller` publishes `BASE_TOPIC/desired` to online SuperMini boards → board applies via `safeSetValve` (fail-open guard intact), persists `des_ver`/`valve_des`/`schedule` to NVS (namespace `ourwater_sm`) → board publishes `BASE_TOPIC/report` → bot writes `reported_version`/`valve_reported`/`valve_confirmed` back. Verified end-to-end on the bench in dev mode.
 
-| Column | Notes |
-|--------|-------|
-| `meter_id` | PK (FK → meters) |
-| `desired_version` | Incremented by dashboard on any change |
-| `reported_version` | Written by board after applying the desired state |
-| `valve_desired` | `open` / `close` — set by dashboard |
-| `valve_reported` | Board's believed physical state — always set on each wake |
-| `valve_confirmed` | True physical position from limit-switch feedback — only set when `feedback_enabled=true` |
-| `feedback_enabled` | Boolean, default `false` — gates limit-switch reads (GPIO6/7); currently `false` because installed valves are defective |
-| `schedule` | JSONB — 15-slot array (see Schedule section) |
+### Sentinel
 
-**Valve pending indicator (dashboard):** `valve_desired ≠ valve_reported` → badge shows "pending" (greyed). No extra column needed.
+`appliedDesiredVersion` / `reported_version` 0 = nothing applied yet, matching a fresh `meter_state` row. First real command is version 1.
 
-**Valve execution:** just drive the relay; no state pre-check. The hardware travel timer arms on every command, whether or not the valve was already in that position. This is intentional — the relay energises briefly and the timer drops it; worst case is a wasted 15 s pulse.
+### /valve/1/cmd RETIRED on SuperMini
 
-**Valve feedback (when `feedback_enabled=true`):** continuous-contact limit switches on GPIO6 (open-sense) and GPIO7 (close-sense). Read true position on every wake. Alarm on mismatch between `valve_reported` and `valve_confirmed`.
+Board handler removed; bot.py skips publishing it for `board_type='esp32s3_supermini_standalone'` (marks the legacy command executed and continues). LTE boards still use the legacy `valve_commands` path — coexistence is deliberate, single-writer per board.
+
+### Valve display
+
+SuperMini badge reads `meter_state`; shows distinct "pending" (dashed grey) while `valve_desired ≠ valve_reported`, resolves to `valve_reported` on confirm. `publishReport` maps only settled `VALVE_OPEN→open` / `VALVE_CLOSED→close`; in-transit → `stopped` (reports physical truth, not intent).
+
+### Valve activity log
+
+For SuperMini, `valve_events` is written by bot.py's `/report` handler on board confirmation (`interface='board-confirmed'`, timestamped at confirmation), NOT at dashboard click time. Only on a genuine `reported_version` advance — repeat reports don't duplicate-log.
+
+### Operating mode
+
+Board publishes `op_mode` (`'dev'|'normal'`) in `/data`; stored in `device_readings.op_mode` (column added via migration); dashboard shows a distinct Operating Mode badge (red DEV — FAIL-SAFES BYPASSED / muted NORMAL). Separate from `power_state` (the power tier).
+
+### Fail-open HOLD
+
+Re-asserted in `loop()` and on every connect while `powerTier == TIER_FAIL_OPEN` (relies on `safeSetValve`'s already-open no-op guard). Boot reassert of persisted `valve_des` runs AFTER `updatePowerTier()` so fail-open wins.
+
+---
+
+## Operating Modes & Wake Cadence *(LOCKED — do not change without field sign-off)*
+
+| Mode | Trigger | Publish cadence | Cap |
+|------|---------|-----------------|-----|
+| Normal | Default | 30 min day (06:00–18:00 local) / 60 min night | — |
+| Test (stay-awake) | Dashboard or Telegram triggered | 1 min | 3 hr hard cap, then returns to Normal |
+| Dev | GPIO47 + GPIO38 both strapped LOW at boot | No cap — publishes at configured `interval_min` | — |
+
+Live windows (board stays connected to check `meter_state`): 06:00–08:00 and 18:00–20:00 local time.
+
+Dongle cycle **RETIRED** as a standalone feature — folded into the wake cadence. The board no longer power-cycles the dongle on a separate timer.
+
+---
+
+## Layer 2 — Sleep Engine *(REMAINING — NOT YET IMPLEMENTED)*
+
+> The meter_state command channel, operating modes, and wake cadence are built (see BUILT & VERIFIED above). Remaining: schedule sync to NVS, local schedule execution, and sleep mechanics.
 
 ### Schedule — 15 fixed slots
 
@@ -484,17 +511,6 @@ Stored locally on the board in NVS and synced from `meter_state.schedule` on con
 - **Watermark / latch:** on each wake, for today's day-of-week, fire any slot whose `time` has already passed and has not yet been actioned today (catches up if the board was asleep at the exact minute). One-shot per slot per calendar day.
 - Valve holds its last commanded state between events (open stays open until a close slot fires).
 - Dashboard editor enforces the 15-slot cap and shows a "pending sync" badge while `desired_version > reported_version`.
-
-### Wake cadence
-
-Hardcoded fleet-wide in firmware — not per-site:
-
-| Period | Cadence |
-|--------|---------|
-| Day (06:00–18:00 local) | Every 30 min |
-| Night (18:00–06:00 local) | Every 60 min |
-
-Per-site valve schedule is in `meter_state`. Per-site dongle timing is already in Supabase `meters` and synced on connect.
 
 ### Manual override
 
