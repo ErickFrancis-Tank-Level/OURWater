@@ -348,8 +348,8 @@ void publishStatus(const char* status) {
 }
 
 void publishReport() {
-    const char* valveRep = (valve1State == VALVE_OPEN)   ? "open"  :
-                           (valve1State == VALVE_CLOSED)  ? "close" : "stopped";
+    const char* valveRep = (valve1State == VALVE_OPEN  || valve1State == VALVE_OPENING) ? "open"  :
+                           (valve1State == VALVE_CLOSED || valve1State == VALVE_CLOSING) ? "close" : "stopped";
     char payload[96];
     snprintf(payload, sizeof(payload),
         "{\"reported_version\":%ld,\"valve_reported\":\"%s\"}",
