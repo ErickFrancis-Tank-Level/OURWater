@@ -1,6 +1,5 @@
 // =============================================================================
 //  OURWater Super Mini  v1.0.0
-#define BENCH_STAY_AWAKE  1   // set to 0 to re-enable sleep
 //  ESP32-S3 Super Mini — WiFi/MQTT standalone water monitoring node
 //
 //  Connects to the internet via a USB 4G dongle.
@@ -19,15 +18,11 @@
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
-#include "esp_sleep.h"
-#include "hal/rwdt_ll.h"      // ESP32-S3 RWDT inline LL (rtc_wdt.h gated to ESP32/S2 only)
 #include "board_config.h"
 
 #define FIRMWARE_VER    "SM-1.0.0"
 #define VALVE_TRAVEL_MS  15000    // ~15 s end-to-end travel; relay de-energised by serviceValve()
 #define WDT_TIMEOUT_S       30    // generous interim — tightened after dongle cycle is non-blocking
-// TEMP: 60s bench-test interval — replace with schedule-driven cadence in Layer 2 Step 2
-#define SLEEP_TEST_INTERVAL_S  60
 
 // ─── Pin assignments ──────────────────────────────────────────────────────────
 #define FLOW_1_PIN         10
@@ -681,167 +676,10 @@ void serviceValve() {
     Serial.printf("[Valve] travel complete (sw-fallback) -> %s\n", valveStateStr());
 }
 
-// ─── RTC watchdog backstop ─────────────────────────────────────────────────────
-// Coarse safety net that survives light sleep: if a full wake cycle never completes
-// within the window, the RWDT hard-resets the board.  Task WDT cannot see this
-// failure because it is released before sleep.
-//
-// ESP32-S3: rtc_wdt.h is guarded to ESP32/S2 only.  Use rwdt_ll.h inline LL directly.
-// RWDT clock = RTC slow clock (internal RC ~90-150 kHz; 32kHz XTAL if fitted).
-// Stage 1 has no EFuse multiplier quirk (unlike Stage 0), so ticks are exact.
-// Use conservative 32768 Hz to bound the worst-case; at 150 kHz the backstop fires
-// in ~52 min instead of 2 h — still a safe "something went terribly wrong" signal.
-// Use Stage 1 (RESET_SYSTEM); Stage 0 left OFF so the existing IDF boot-WDT stage
-// that is set before our code runs is not disturbed.
-static rtc_cntl_dev_t* const RWDT = &RTCCNTL;
-
-// 2-hour backstop in 32768-Hz ticks (conservative lower-bound clock).
-static const uint32_t RWDT_TICKS_2H = (uint32_t)(2UL * 3600UL * 32768UL);  // 235,929,600
-
-static void armRtcWatchdog() {
-    rwdt_ll_write_protect_disable(RWDT);
-    rwdt_ll_disable(RWDT);
-    rwdt_ll_set_flashboot_en(RWDT, false);
-    // Stage 0 OFF — leave the IDF boot watchdog stage undisturbed
-    rwdt_ll_disable_stage(RWDT, WDT_STAGE0);
-    // Stage 1 → system reset after 2-hour backstop tick count
-    rwdt_ll_config_stage(RWDT, WDT_STAGE1, RWDT_TICKS_2H, WDT_STAGE_ACTION_RESET_SYSTEM);
-    rwdt_ll_set_sys_reset_length(RWDT, WDT_RESET_SIG_LENGTH_3_2us);
-    rwdt_ll_set_pause_in_sleep_en(RWDT, false);   // must NOT pause — that's the whole point
-    rwdt_ll_enable(RWDT);
-    rwdt_ll_write_protect_enable(RWDT);
-    Serial.printf("[WDT] RWDT backstop armed: stage1=%lu ticks (~2h at 32kHz), survives sleep\n",
-                  (unsigned long)RWDT_TICKS_2H);
-}
-
-static void feedRtcWatchdog() {
-    rwdt_ll_write_protect_disable(RWDT);
-    rwdt_ll_feed(RWDT);
-    rwdt_ll_write_protect_enable(RWDT);
-}
-
-// ─── Light sleep test — Layer 2 Step 1 ────────────────────────────────────────
-// TEMP: Active when SLEEP_TEST_MODE=true.  Replaces normal loop() entirely so the
-// sleep/WDT primitive can be proven in isolation before schedule/WiFi layers on.
-// Remove this function (and its call in loop()) in Layer 2 Step 2.
-
-static const char* sleepWakeReasonStr(esp_sleep_wakeup_cause_t cause) {
-    switch (cause) {
-        case ESP_SLEEP_WAKEUP_TIMER:     return "TIMER";
-        case ESP_SLEEP_WAKEUP_GPIO:      return "GPIO";
-        case ESP_SLEEP_WAKEUP_UNDEFINED: return "BOOT";
-        default:                         return "OTHER";
-    }
-}
-
-// Print line repeatedly for window_ms after every wake.
-// ESP32-S3 HWCDC (USB-Serial/JTAG): operator bool() checks TX FIFO space, not host connection;
-// it returns true the instant USB re-enumerates, before the host has opened the COM port.
-// Printing repeatedly until the window expires guarantees the host catches at least one line
-// no matter when during re-enumeration (~3-5s on Windows) it opens the port.
-static void printRepeat(const char* line, uint32_t window_ms) {
-    uint32_t t = millis();
-    while (millis() - t < window_ms) {
-        esp_task_wdt_reset();
-        Serial.printf("%s  +%lums\r\n", line, (unsigned long)(millis() - t));
-        Serial.flush();   // trigger USB packet send; safe because setTxTimeoutMs(0) prevents blocking
-        delay(500);
-    }
-}
-
-void runSleepTestCycle() {
-    static bool firstRun = true;
-    char markerBuf[80];
-
-    if (firstRun) {
-        firstRun = false;
-        // Print boot header repeatedly for 15s — host may not have port open at power-on.
-        printRepeat("[Sleep] === SLEEP TEST MODE ACTIVE ===", 15000);
-        Serial.printf("[Sleep] %ds sleep interval, task-WDT release/re-arm around each sleep\r\n",
-                      SLEEP_TEST_INTERVAL_S);
-    }
-
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-
-    {
-        const char* wc = (cause == ESP_SLEEP_WAKEUP_TIMER)    ? "TIMER"     :
-                         (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ? "UNDEFINED" :
-                         (cause == ESP_SLEEP_WAKEUP_GPIO)      ? "GPIO"      : "OTHER";
-        Serial.printf("[WAKE] cause=%s pulses=%lu uptime_ms=%lu\r\n",
-                      wc, (unsigned long)pulseCount, (unsigned long)millis());
-    }
-
-    // Print wake reason + pulse count repeatedly for 15s.
-    // The first few prints land before USB CDC re-enumerates (dropped); later ones get through.
-    snprintf(markerBuf, sizeof(markerBuf), "[Wake] reason=%s  pulses=%lu",
-             sleepWakeReasonStr(cause), (unsigned long)pulseCount);
-    printRepeat(markerBuf, 15000);
-
-    // Then a 5s countdown before sleep
-    for (int i = 5; i > 0; i--) {
-        esp_task_wdt_reset();
-        Serial.printf("[Awake] sleeping in %ds  pulses=%lu\r\n", i, (unsigned long)pulseCount);
-        delay(1000);
-    }
-
-    // Sleep loop — GPIO (flow) wakes handled internally; exits only on TIMER wake
-    while (true) {
-        esp_task_wdt_delete(NULL);   // task WDT must not fire while CPU is halted
-        // feedRtcWatchdog();   // TEMP disabled
-        Serial.printf("[Sleep] entering light sleep for %ds, task-WDT released\r\n",
-                      SLEEP_TEST_INTERVAL_S);
-        Serial.flush();   // drain TX FIFO — IDF aborts light sleep if USB TX is in-progress
-        delay(50);
-
-        esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_TEST_INTERVAL_S * 1000000ULL);
-        gpio_wakeup_enable((gpio_num_t)FLOW_1_PIN, GPIO_INTR_LOW_LEVEL);
-        esp_sleep_enable_gpio_wakeup();
-
-#if BENCH_STAY_AWAKE
-        Serial.println("[Sleep] BENCH_STAY_AWAKE=1 — skipping sleep, staying awake");
-        Serial.flush();
-        esp_task_wdt_add(NULL);   // re-arm so the post-sleep path is consistent
-        esp_task_wdt_reset();
-        break;
-#else
-        esp_light_sleep_start();   // CPU halts here until wake event
-#endif
-
-        // Re-arm task WDT immediately on wake — before any delay.
-        esp_task_wdt_add(NULL);
-        esp_task_wdt_reset();
-        // feedRtcWatchdog();   // TEMP disabled
-
-        // USB-CDC re-enumerates after light sleep (USB powered off during sleep).
-        // The USB RESET that occurs mid-enumeration clears the TX FIFO; any prints
-        // sent before re-enum completes are silently dropped.
-        // Wait 5 s so the host has time to re-open COM8 before we start printing.
-        for (int i = 0; i < 50; i++) { esp_task_wdt_reset(); delay(100); }
-
-        cause = esp_sleep_get_wakeup_cause();
-
-        {
-            const char* wc = (cause == ESP_SLEEP_WAKEUP_TIMER)    ? "TIMER"     :
-                             (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ? "UNDEFINED" :
-                             (cause == ESP_SLEEP_WAKEUP_GPIO)      ? "GPIO"      : "OTHER";
-            Serial.printf("[WAKE] cause=%s pulses=%lu uptime_ms=%lu\r\n",
-                          wc, (unsigned long)pulseCount, (unsigned long)millis());
-        }
-
-        // Print wake reason repeatedly for 15s post-sleep — same USB re-enum reasoning.
-        snprintf(markerBuf, sizeof(markerBuf), "[Wake] reason=%s  pulses=%lu",
-                 sleepWakeReasonStr(cause), (unsigned long)pulseCount);
-        printRepeat(markerBuf, 15000);
-
-        if (cause == ESP_SLEEP_WAKEUP_TIMER) break;
-        // GPIO wake: flow ISR already ran on wake, pulseCount incremented — go back to sleep
-    }
-}
-
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.setTxTimeoutMs(50);  // near-non-blocking TX: 50ms max wait prevents freeze, gives post-wake FIFO time to become ready
+    Serial.setTxTimeoutMs(50);  // near-non-blocking TX: 50ms max wait prevents freeze
     delay(3000);   // give native USB CDC time to enumerate with host on cold boot
     Serial.println("\n=============================");
     Serial.println(" OURWater Super Mini v" FIRMWARE_VER);
@@ -988,19 +826,12 @@ void setup() {
         Serial.printf("[WDT] Task watchdog armed: %d s, loop task subscribed\n", WDT_TIMEOUT_S);
     }
 
-    // armRtcWatchdog();  // TEMP disabled — isolating crash source
-
     Serial.println("[Boot] System ready");
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-#if !BENCH_STAY_AWAKE
-    if (SLEEP_TEST_MODE && !devMode) { runSleepTestCycle(); return; }
-#endif
-
     if (!devMode) esp_task_wdt_reset();   // feed the watchdog every iteration
-    // feedRtcWatchdog();   // TEMP disabled — RWDT not armed
     serviceValve();   // first — de-energises relay on travel timeout even while MQTT is down
     serviceLED();     // non-blocking RGB status update
 
